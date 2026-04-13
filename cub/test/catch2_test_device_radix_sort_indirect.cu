@@ -96,7 +96,8 @@ TEST_CASE("DeviceRadixSort::SortPairs indirect num_items", "[radix_sort][device]
       thrust::raw_pointer_cast(d_values_in.data()),
       thrust::raw_pointer_cast(d_values_out.data()),
       d_num_items,
-      max_num_items));
+      max_num_items,
+      0, static_cast<int>(sizeof(int) * 8)));
   REQUIRE(temp_storage_bytes > 0);
 
   thrust::device_vector<std::uint8_t> d_temp(temp_storage_bytes);
@@ -112,7 +113,8 @@ TEST_CASE("DeviceRadixSort::SortPairs indirect num_items", "[radix_sort][device]
       thrust::raw_pointer_cast(d_values_in.data()),
       thrust::raw_pointer_cast(d_values_out.data()),
       d_num_items,
-      max_num_items));
+      max_num_items,
+      0, static_cast<int>(sizeof(int) * 8)));
 
   std::vector<int> ref_keys, ref_values;
   sort_pairs_reference(h_keys, h_values, ref_keys, ref_values, actual_num_items, false);
@@ -158,7 +160,8 @@ TEST_CASE("DeviceRadixSort::SortPairsDescending indirect num_items", "[radix_sor
       thrust::raw_pointer_cast(d_values_in.data()),
       thrust::raw_pointer_cast(d_values_out.data()),
       d_num_items,
-      max_num_items));
+      max_num_items,
+      0, static_cast<int>(sizeof(int) * 8)));
 
   thrust::device_vector<std::uint8_t> d_temp(temp_storage_bytes);
   d_temp_storage = thrust::raw_pointer_cast(d_temp.data());
@@ -173,7 +176,8 @@ TEST_CASE("DeviceRadixSort::SortPairsDescending indirect num_items", "[radix_sor
       thrust::raw_pointer_cast(d_values_in.data()),
       thrust::raw_pointer_cast(d_values_out.data()),
       d_num_items,
-      max_num_items));
+      max_num_items,
+      0, static_cast<int>(sizeof(int) * 8)));
 
   std::vector<int> ref_keys, ref_values;
   sort_pairs_reference(h_keys, h_values, ref_keys, ref_values, actual_num_items, true);
@@ -213,7 +217,8 @@ TEST_CASE("DeviceRadixSort::SortKeys indirect num_items", "[radix_sort][device]"
       thrust::raw_pointer_cast(d_keys_in.data()),
       thrust::raw_pointer_cast(d_keys_out.data()),
       d_num_items,
-      max_num_items));
+      max_num_items,
+      0, static_cast<int>(sizeof(int) * 8)));
 
   thrust::device_vector<std::uint8_t> d_temp(temp_storage_bytes);
   d_temp_storage = thrust::raw_pointer_cast(d_temp.data());
@@ -226,7 +231,8 @@ TEST_CASE("DeviceRadixSort::SortKeys indirect num_items", "[radix_sort][device]"
       thrust::raw_pointer_cast(d_keys_in.data()),
       thrust::raw_pointer_cast(d_keys_out.data()),
       d_num_items,
-      max_num_items));
+      max_num_items,
+      0, static_cast<int>(sizeof(int) * 8)));
 
   auto ref_keys = sort_reference(h_keys, actual_num_items, false);
 
@@ -263,7 +269,8 @@ TEST_CASE("DeviceRadixSort::SortKeysDescending indirect num_items", "[radix_sort
       thrust::raw_pointer_cast(d_keys_in.data()),
       thrust::raw_pointer_cast(d_keys_out.data()),
       d_num_items,
-      max_num_items));
+      max_num_items,
+      0, static_cast<int>(sizeof(int) * 8)));
 
   thrust::device_vector<std::uint8_t> d_temp(temp_storage_bytes);
   d_temp_storage = thrust::raw_pointer_cast(d_temp.data());
@@ -276,7 +283,8 @@ TEST_CASE("DeviceRadixSort::SortKeysDescending indirect num_items", "[radix_sort
       thrust::raw_pointer_cast(d_keys_in.data()),
       thrust::raw_pointer_cast(d_keys_out.data()),
       d_num_items,
-      max_num_items));
+      max_num_items,
+      0, static_cast<int>(sizeof(int) * 8)));
 
   auto ref_keys = sort_reference(h_keys, actual_num_items, true);
 
@@ -319,7 +327,8 @@ TEST_CASE("DeviceRadixSort::SortPairs indirect with float keys", "[radix_sort][d
       thrust::raw_pointer_cast(d_values_in.data()),
       thrust::raw_pointer_cast(d_values_out.data()),
       d_num_items,
-      max_num_items));
+      max_num_items,
+      0, static_cast<int>(sizeof(int) * 8)));
 
   thrust::device_vector<std::uint8_t> d_temp(temp_storage_bytes);
   d_temp_storage = thrust::raw_pointer_cast(d_temp.data());
@@ -334,7 +343,8 @@ TEST_CASE("DeviceRadixSort::SortPairs indirect with float keys", "[radix_sort][d
       thrust::raw_pointer_cast(d_values_in.data()),
       thrust::raw_pointer_cast(d_values_out.data()),
       d_num_items,
-      max_num_items));
+      max_num_items,
+      0, static_cast<int>(sizeof(int) * 8)));
 
   std::vector<float> ref_keys;
   std::vector<int> ref_values;
@@ -380,7 +390,8 @@ TEST_CASE("DeviceRadixSort indirect num_items varying between calls", "[radix_so
       thrust::raw_pointer_cast(d_values_in.data()),
       thrust::raw_pointer_cast(d_values_out.data()),
       static_cast<const int*>(d_num_items),
-      max_num_items));
+      max_num_items,
+        0, static_cast<int>(sizeof(int) * 8)));
 
   thrust::device_vector<std::uint8_t> d_temp(temp_storage_bytes);
   d_temp_storage = thrust::raw_pointer_cast(d_temp.data());
@@ -401,7 +412,8 @@ TEST_CASE("DeviceRadixSort indirect num_items varying between calls", "[radix_so
         thrust::raw_pointer_cast(d_values_in.data()),
         thrust::raw_pointer_cast(d_values_out.data()),
         static_cast<const int*>(d_num_items),
-        max_num_items));
+        max_num_items,
+        0, static_cast<int>(sizeof(int) * 8)));
 
     std::vector<int> ref_keys, ref_values;
     sort_pairs_reference(h_keys, h_values, ref_keys, ref_values, n, false);

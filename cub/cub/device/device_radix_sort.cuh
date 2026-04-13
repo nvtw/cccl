@@ -5097,12 +5097,14 @@ public:
   //!    cub::DeviceRadixSort::SortPairs(
   //!        d_temp_storage, temp_storage_bytes,
   //!        d_keys_in, d_keys_out, d_values_in, d_values_out,
-  //!        d_num_items, max_num_items);
+  //!        d_num_items, max_num_items,
+  //!        0, sizeof(int) * 8);
   //!    cudaMalloc(&d_temp_storage, temp_storage_bytes);
   //!    cub::DeviceRadixSort::SortPairs(
   //!        d_temp_storage, temp_storage_bytes,
   //!        d_keys_in, d_keys_out, d_values_in, d_values_out,
-  //!        d_num_items, max_num_items);
+  //!        d_num_items, max_num_items,
+  //!        0, sizeof(int) * 8);
   //!
   //! @endrst
   //!
@@ -5163,15 +5165,15 @@ public:
     ValueT* d_values_out,
     const NumItemsT* d_num_items,
     NumItemsT max_num_items,
-    int begin_bit       = 0,
-    int end_bit         = sizeof(KeyT) * 8,
+    int begin_bit,
+    int end_bit,
     cudaStream_t stream = 0)
   {
     _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceRadixSort::SortPairs");
 
     using OffsetT = detail::choose_offset_t<NumItemsT>;
 
-    return detail::radix_sort::dispatch_indirect<detail::radix_sort::SortOrder::Ascending>(
+    return detail::radix_sort::dispatch_indirect<SortOrder::Ascending>(
       d_temp_storage,
       temp_storage_bytes,
       d_keys_in,
@@ -5202,15 +5204,15 @@ public:
     ValueT* d_values_out,
     const NumItemsT* d_num_items,
     NumItemsT max_num_items,
-    int begin_bit       = 0,
-    int end_bit         = sizeof(KeyT) * 8,
+    int begin_bit,
+    int end_bit,
     cudaStream_t stream = 0)
   {
     _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceRadixSort::SortPairsDescending");
 
     using OffsetT = detail::choose_offset_t<NumItemsT>;
 
-    return detail::radix_sort::dispatch_indirect<detail::radix_sort::SortOrder::Descending>(
+    return detail::radix_sort::dispatch_indirect<SortOrder::Descending>(
       d_temp_storage,
       temp_storage_bytes,
       d_keys_in,
@@ -5239,8 +5241,8 @@ public:
     KeyT* d_keys_out,
     const NumItemsT* d_num_items,
     NumItemsT max_num_items,
-    int begin_bit       = 0,
-    int end_bit         = sizeof(KeyT) * 8,
+    int begin_bit,
+    int end_bit,
     cudaStream_t stream = 0)
   {
     _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceRadixSort::SortKeys");
@@ -5250,7 +5252,7 @@ public:
     constexpr NullType* d_values_in  = nullptr;
     constexpr NullType* d_values_out = nullptr;
 
-    return detail::radix_sort::dispatch_indirect<detail::radix_sort::SortOrder::Ascending>(
+    return detail::radix_sort::dispatch_indirect<SortOrder::Ascending>(
       d_temp_storage,
       temp_storage_bytes,
       d_keys_in,
@@ -5279,8 +5281,8 @@ public:
     KeyT* d_keys_out,
     const NumItemsT* d_num_items,
     NumItemsT max_num_items,
-    int begin_bit       = 0,
-    int end_bit         = sizeof(KeyT) * 8,
+    int begin_bit,
+    int end_bit,
     cudaStream_t stream = 0)
   {
     _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceRadixSort::SortKeysDescending");
@@ -5290,7 +5292,7 @@ public:
     constexpr NullType* d_values_in  = nullptr;
     constexpr NullType* d_values_out = nullptr;
 
-    return detail::radix_sort::dispatch_indirect<detail::radix_sort::SortOrder::Descending>(
+    return detail::radix_sort::dispatch_indirect<SortOrder::Descending>(
       d_temp_storage,
       temp_storage_bytes,
       d_keys_in,
