@@ -601,8 +601,8 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceRadixSortIndirectLookbackMemsetKernel(
   {
     return;
   }
-  const PortionOffsetT portion_num_items = static_cast<PortionOffsetT>(
-    ::cuda::std::min(total_num_items - portion_offset, static_cast<OffsetT>(((1 << 28) - 1) / tile_items * tile_items)));
+  const PortionOffsetT portion_num_items = static_cast<PortionOffsetT>(::cuda::std::min(
+    total_num_items - portion_offset, static_cast<OffsetT>(((1 << 28) - 1) / tile_items * tile_items)));
   const PortionOffsetT actual_num_blocks = (portion_num_items + tile_items - 1) / tile_items;
   const int total_entries                = actual_num_blocks * radix_digits;
   const int i                            = blockIdx.x * blockDim.x + threadIdx.x;

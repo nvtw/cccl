@@ -1827,18 +1827,8 @@ CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE cudaError_t dispatch_indirect_double_buff
       AtomicOffsetT* d_ctrs            = (AtomicOffsetT*) allocations[2];
       AtomicOffsetT* d_pre_filter_ctrs = (AtomicOffsetT*) allocations[3];
 
-      // Memset counters
-      if (const auto error =
-            CubDebug(cudaMemsetAsync(d_ctrs, 0, max_num_portions * num_passes * sizeof(AtomicOffsetT), stream)))
-      {
-        return error;
-      }
-      if (const auto error = CubDebug(
-            cudaMemsetAsync(d_pre_filter_ctrs, 0, max_num_portions * num_passes * sizeof(AtomicOffsetT), stream)))
-      {
-        return error;
-      }
-      if (const auto error = CubDebug(cudaMemsetAsync(d_bins, 0, num_passes * RADIX_DIGITS * sizeof(OffsetT), stream)))
+      // Zero all temp storage in one call (bins, lookback, ctrs, pre_filter_ctrs are contiguous)
+      if (const auto error = CubDebug(cudaMemsetAsync(d_temp_storage, 0, temp_storage_bytes, stream)))
       {
         return error;
       }
@@ -1899,18 +1889,11 @@ CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE cudaError_t dispatch_indirect_double_buff
             ::cuda::std::min(max_num_items - portion_offset, static_cast<OffsetT>(PORTION_SIZE)));
           PortionOffsetT max_portion_blocks = ::cuda::ceil_div(max_portion_num_items, ONESWEEP_TILE_ITEMS);
 
-          // Indirect lookback memset: only clears entries for actual data
+          // Re-zero lookback for this pass (skip first pass - already zeroed by the full memset above)
+          if (pass > 0 || portion > 0)
           {
-            constexpr int memset_block = 256;
-            int memset_grid = ::cuda::ceil_div(max_portion_blocks * RADIX_DIGITS, memset_block);
             if (const auto error = CubDebug(
-                  launcher_factory(memset_grid, memset_block, 0, stream)
-                    .doit(DeviceRadixSortIndirectLookbackMemsetKernel<AtomicOffsetT, OffsetT, PortionOffsetT>,
-                          d_lookback,
-                          d_num_items,
-                          portion_offset,
-                          RADIX_DIGITS,
-                          ONESWEEP_TILE_ITEMS)))
+                  cudaMemsetAsync(d_lookback, 0, max_portion_blocks * RADIX_DIGITS * sizeof(AtomicOffsetT), stream)))
             {
               return error;
             }
