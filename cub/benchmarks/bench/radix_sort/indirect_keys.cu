@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 // SPDX-License-Identifier: BSD-3
 
-// Benchmark for indirect (device-accessible num_items) radix sort vs standard radix sort.
-// Includes CUDA graph capture benchmarks.
+// Benchmark for indirect (device-accessible num_items) radix sort keys.
+// Compares indirect stream launch, standard stream launch, and graph-captured replay.
 
 #include <cub/device/device_radix_sort.cuh>
 
@@ -41,28 +41,19 @@ try
 
   size_t tmp_size{};
   cub::DeviceRadixSort::SortKeys(
-    nullptr,
-    tmp_size,
+    nullptr, tmp_size,
     thrust::raw_pointer_cast(input_1.data()),
     thrust::raw_pointer_cast(input_2.data()),
-    d_num_items,
-    max_items,
-    begin_bit,
-    end_bit);
+    d_num_items, max_items, begin_bit, end_bit);
 
   thrust::device_vector<nvbench::uint8_t> tmp(tmp_size, thrust::no_init);
 
   state.exec(nvbench::exec_tag::gpu | nvbench::exec_tag::no_batch, [&](nvbench::launch& launch) {
     cub::DeviceRadixSort::SortKeys(
-      thrust::raw_pointer_cast(tmp.data()),
-      tmp_size,
+      thrust::raw_pointer_cast(tmp.data()), tmp_size,
       thrust::raw_pointer_cast(input_1.data()),
       thrust::raw_pointer_cast(input_2.data()),
-      d_num_items,
-      max_items,
-      begin_bit,
-      end_bit,
-      launch.get_stream());
+      d_num_items, max_items, begin_bit, end_bit, launch.get_stream());
   });
 }
 catch (const std::bad_alloc&)
@@ -91,26 +82,19 @@ try
 
   size_t tmp_size{};
   cub::DeviceRadixSort::SortKeys(
-    nullptr,
-    tmp_size,
+    nullptr, tmp_size,
     thrust::raw_pointer_cast(buffer_1.data()),
     thrust::raw_pointer_cast(buffer_2.data()),
-    static_cast<offset_t>(elements),
-    begin_bit,
-    end_bit);
+    static_cast<offset_t>(elements), begin_bit, end_bit);
 
   thrust::device_vector<nvbench::uint8_t> tmp(tmp_size, thrust::no_init);
 
   state.exec(nvbench::exec_tag::gpu | nvbench::exec_tag::no_batch, [&](nvbench::launch& launch) {
     cub::DeviceRadixSort::SortKeys(
-      thrust::raw_pointer_cast(tmp.data()),
-      tmp_size,
+      thrust::raw_pointer_cast(tmp.data()), tmp_size,
       thrust::raw_pointer_cast(buffer_1.data()),
       thrust::raw_pointer_cast(buffer_2.data()),
-      static_cast<offset_t>(elements),
-      begin_bit,
-      end_bit,
-      launch.get_stream());
+      static_cast<offset_t>(elements), begin_bit, end_bit, launch.get_stream());
   });
 }
 catch (const std::bad_alloc&)
@@ -119,7 +103,7 @@ catch (const std::bad_alloc&)
 }
 
 // ============================================================================
-// CUDA graph benchmarks
+// CUDA graph benchmarks - capture once, replay many times
 // ============================================================================
 
 template <typename T, typename OffsetT>
@@ -149,18 +133,14 @@ try
 
   size_t tmp_size{};
   cub::DeviceRadixSort::SortKeys(
-    nullptr,
-    tmp_size,
+    nullptr, tmp_size,
     thrust::raw_pointer_cast(input_1.data()),
     thrust::raw_pointer_cast(input_2.data()),
-    d_num_items,
-    max_items,
-    begin_bit,
-    end_bit);
+    d_num_items, max_items, begin_bit, end_bit);
 
   thrust::device_vector<nvbench::uint8_t> tmp(tmp_size, thrust::no_init);
 
-  // Capture graph
+  // Capture graph once
   cudaStream_t capture_stream{};
   cudaStreamCreate(&capture_stream);
 
@@ -168,21 +148,17 @@ try
   cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
 
   cub::DeviceRadixSort::SortKeys(
-    thrust::raw_pointer_cast(tmp.data()),
-    tmp_size,
+    thrust::raw_pointer_cast(tmp.data()), tmp_size,
     thrust::raw_pointer_cast(input_1.data()),
     thrust::raw_pointer_cast(input_2.data()),
-    d_num_items,
-    max_items,
-    begin_bit,
-    end_bit,
-    capture_stream);
+    d_num_items, max_items, begin_bit, end_bit, capture_stream);
 
   cudaStreamEndCapture(capture_stream, &graph);
 
   cudaGraphExec_t graph_exec{};
   cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0);
 
+  // Benchmark replaying the graph
   state.exec(nvbench::exec_tag::gpu | nvbench::exec_tag::no_batch, [&](nvbench::launch& launch) {
     cudaGraphLaunch(graph_exec, launch.get_stream());
   });
@@ -198,22 +174,25 @@ catch (const std::bad_alloc&)
 
 using sort_types = nvbench::type_list<nvbench::int32_t, nvbench::uint32_t>;
 
+// Stream-based indirect sort (measure overhead of indirect dispatch)
 NVBENCH_BENCH_TYPES(indirect_radix_sort_keys, NVBENCH_TYPE_AXES(sort_types, offset_types))
   .set_name("indirect_radix_sort_keys")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(16, 28, 4))
-  .add_float64_axis("FillRatio", {0.01, 0.1, 0.5, 1.0})
+  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(10, 28, 2))
+  .add_float64_axis("FillRatio", {0.001, 0.01, 0.1, 0.5, 1.0})
   .add_string_axis("Entropy", {"1.000", "0.201"});
 
+// Standard sort baseline
 NVBENCH_BENCH_TYPES(standard_radix_sort_keys, NVBENCH_TYPE_AXES(sort_types, offset_types))
   .set_name("standard_radix_sort_keys")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(16, 28, 4))
+  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(10, 28, 2))
   .add_string_axis("Entropy", {"1.000", "0.201"});
 
+// Graph-captured indirect sort (the real use case!)
 NVBENCH_BENCH_TYPES(indirect_radix_sort_keys_graph, NVBENCH_TYPE_AXES(sort_types, offset_types))
   .set_name("indirect_radix_sort_keys_graph")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(16, 28, 4))
-  .add_float64_axis("FillRatio", {0.01, 0.1, 0.5, 1.0})
+  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(10, 28, 2))
+  .add_float64_axis("FillRatio", {0.001, 0.01, 0.1, 0.5, 1.0})
   .add_string_axis("Entropy", {"1.000", "0.201"});

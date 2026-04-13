@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BSD-3
 
 // Benchmark for indirect (device-accessible num_items) scan vs standard scan.
-// Includes CUDA graph capture benchmarks to measure the real use case.
+// Includes CUDA graph capture benchmarks to measure the real use case:
+// capture once, replay many times with varying lengths.
 
 #include <cub/device/device_scan.cuh>
 
@@ -37,7 +38,12 @@ try
 
   size_t tmp_size{};
   cub::DeviceScan::ExclusiveSum(
-    nullptr, tmp_size, thrust::raw_pointer_cast(input.data()), thrust::raw_pointer_cast(output.data()), d_num_items, max_items);
+    nullptr,
+    tmp_size,
+    thrust::raw_pointer_cast(input.data()),
+    thrust::raw_pointer_cast(output.data()),
+    d_num_items,
+    max_items);
 
   thrust::device_vector<nvbench::uint8_t> tmp(tmp_size, thrust::no_init);
 
@@ -98,7 +104,7 @@ catch (const std::bad_alloc&)
 }
 
 // ============================================================================
-// CUDA graph benchmarks - captures once, replays many times
+// CUDA graph benchmarks - captures once, replays (this is the real use case)
 // ============================================================================
 
 template <typename T, typename OffsetT>
@@ -124,11 +130,16 @@ try
 
   size_t tmp_size{};
   cub::DeviceScan::ExclusiveSum(
-    nullptr, tmp_size, thrust::raw_pointer_cast(input.data()), thrust::raw_pointer_cast(output.data()), d_num_items, max_items);
+    nullptr,
+    tmp_size,
+    thrust::raw_pointer_cast(input.data()),
+    thrust::raw_pointer_cast(output.data()),
+    d_num_items,
+    max_items);
 
   thrust::device_vector<nvbench::uint8_t> tmp(tmp_size, thrust::no_init);
 
-  // Capture graph
+  // Capture graph once
   cudaStream_t capture_stream{};
   cudaStreamCreate(&capture_stream);
 
@@ -149,6 +160,7 @@ try
   cudaGraphExec_t graph_exec{};
   cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0);
 
+  // Benchmark replaying the graph
   state.exec(nvbench::exec_tag::gpu | nvbench::exec_tag::no_batch, [&](nvbench::launch& launch) {
     cudaGraphLaunch(graph_exec, launch.get_stream());
   });
@@ -164,19 +176,22 @@ catch (const std::bad_alloc&)
 
 using types = nvbench::type_list<nvbench::int32_t, nvbench::float32_t>;
 
+// Stream-based indirect scan at various fill ratios
 NVBENCH_BENCH_TYPES(indirect_exclusive_sum, NVBENCH_TYPE_AXES(types, offset_types))
   .set_name("indirect_exclusive_sum")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(16, 28, 4))
-  .add_float64_axis("FillRatio", {0.01, 0.1, 0.5, 1.0});
+  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(10, 28, 2))
+  .add_float64_axis("FillRatio", {0.001, 0.01, 0.1, 0.25, 0.5, 0.75, 1.0});
 
+// Standard scan baseline
 NVBENCH_BENCH_TYPES(standard_exclusive_sum, NVBENCH_TYPE_AXES(types, offset_types))
   .set_name("standard_exclusive_sum")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(16, 28, 4));
+  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(10, 28, 2));
 
+// Graph-captured indirect scan (the real use case)
 NVBENCH_BENCH_TYPES(indirect_exclusive_sum_graph, NVBENCH_TYPE_AXES(types, offset_types))
   .set_name("indirect_exclusive_sum_graph")
   .set_type_axes_names({"T{ct}", "OffsetT{ct}"})
-  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(16, 28, 4))
-  .add_float64_axis("FillRatio", {0.01, 0.1, 0.5, 1.0});
+  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(10, 28, 2))
+  .add_float64_axis("FillRatio", {0.001, 0.01, 0.1, 0.25, 0.5, 0.75, 1.0});
