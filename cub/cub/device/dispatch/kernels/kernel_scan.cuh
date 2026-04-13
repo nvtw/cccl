@@ -258,6 +258,90 @@ __launch_bounds__(device_scan_launch_bounds<PolicySelector>, 1) _CCCL_KERNEL_ATT
       .ConsumeRange(num_items, tile_state.lookback, start_tile);
   }
 }
+/**
+ * @brief Indirect scan kernel entry point (multi-block)
+ *
+ * Like DeviceScanKernel, but reads the actual number of items from a device pointer.
+ * The grid is launched for max_num_items tiles. Tiles beyond the actual num_items
+ * set their tile state to inclusive with a zero aggregate and return without processing data.
+ * This enables CUDA graph capture for variable-length scan problems.
+ */
+template <typename PolicySelector,
+          typename InputIteratorT,
+          typename OutputIteratorT,
+          typename ScanTileState,
+          typename ScanOpT,
+          typename InitValueT,
+          typename OffsetT,
+          typename AccumT,
+          bool ForceInclusive,
+          typename RealInitValueT = typename InitValueT::value_type>
+__launch_bounds__(device_scan_launch_bounds<PolicySelector>, 1) _CCCL_KERNEL_ATTRIBUTES void DeviceScanIndirectKernel(
+  _CCCL_GRID_CONSTANT const InputIteratorT d_in,
+  _CCCL_GRID_CONSTANT const OutputIteratorT d_out,
+  tile_state_kernel_arg_t<ScanTileState, AccumT> tile_state,
+  _CCCL_GRID_CONSTANT const int start_tile,
+  ScanOpT scan_op,
+#if _CCCL_CUDACC_AT_LEAST(12, 8)
+  _CCCL_GRID_CONSTANT
+#endif // _CCCL_CUDACC_AT_LEAST(12, 8)
+  const InitValueT init_value,
+  _CCCL_GRID_CONSTANT const OffsetT* d_num_items,
+  _CCCL_GRID_CONSTANT const int num_stages)
+{
+  static constexpr scan_policy active_policy   = PolicySelector{}(::cuda::arch_id{CUB_PTX_ARCH / 10});
+  static constexpr scan_lookback_policy policy = active_policy.lookback;
+  static_assert(policy.load_modifier != CacheLoadModifier::LOAD_LDG,
+                "The memory consistency model does not apply to texture accesses");
+  using ScanPolicyT = AgentScanPolicy<
+    0,
+    0,
+    void,
+    policy.load_algorithm,
+    policy.load_modifier,
+    policy.store_algorithm,
+    policy.scan_algorithm,
+    NoScaling<policy.block_threads, policy.items_per_thread>,
+    delay_constructor_t<policy.delay_constructor.kind,
+                        policy.delay_constructor.delay,
+                        policy.delay_constructor.l2_write_latency>>;
+
+  using AgentScanT = detail::scan::AgentScan<
+    ScanPolicyT,
+    InputIteratorT,
+    OutputIteratorT,
+    ScanOpT,
+    RealInitValueT,
+    OffsetT,
+    AccumT,
+    ForceInclusive,
+    /* UsePDL */ true>;
+
+  __shared__ typename AgentScanT::TempStorage temp_storage;
+
+  _CCCL_PDL_GRID_DEPENDENCY_SYNC();
+
+  const OffsetT num_items = *d_num_items;
+
+  constexpr int TILE_ITEMS  = ScanPolicyT::BLOCK_THREADS * ScanPolicyT::ITEMS_PER_THREAD;
+  const int tile_idx        = start_tile + blockIdx.x;
+  const OffsetT tile_offset = static_cast<OffsetT>(TILE_ITEMS) * tile_idx;
+
+  if (tile_offset >= num_items)
+  {
+    // This tile is beyond the actual num_items. Mark it as complete in the
+    // tile state so lookback from other tiles does not stall.
+    if (threadIdx.x == 0)
+    {
+      tile_state.lookback.SetInclusive(tile_idx, AccumT{});
+    }
+    return;
+  }
+
+  RealInitValueT real_init_value = init_value;
+  AgentScanT(temp_storage, d_in, d_out, scan_op, real_init_value)
+    .ConsumeRange(num_items, tile_state.lookback, start_tile);
+}
 } // namespace detail::scan
 
 CUB_NAMESPACE_END

@@ -1910,6 +1910,214 @@ struct DeviceScan
 
   //! @}
 
+  //! @}
+
+  //! @name Indirect scans (device-accessible num_items)
+  //! @{
+
+  //! @brief Computes a device-wide exclusive prefix sum where the number of items is stored in device memory.
+  //!
+  //! This overload enables CUDA graph capture for variable-length scan problems.
+  //! The grid is sized for ``max_num_items``, but the kernel reads the actual count from ``d_num_items``
+  //! at execution time. Tiles beyond the actual count are no-ops.
+  //!
+  //! @tparam InputIteratorT
+  //!   **[inferred]** Random-access input iterator type for reading scan inputs @iterator
+  //! @tparam OutputIteratorT
+  //!   **[inferred]** Random-access output iterator type for writing scan outputs @iterator
+  //! @tparam NumItemsT
+  //!   **[inferred]** An integral type representing the number of input elements
+  //!
+  //! @param[in] d_temp_storage
+  //!   Device-accessible allocation of temporary storage. When `nullptr`, the
+  //!   required allocation size is written to `temp_storage_bytes` and no work is done.
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of `d_temp_storage` allocation
+  //! @param[in] d_in
+  //!   Random-access iterator to the input sequence of data items
+  //! @param[out] d_out
+  //!   Random-access iterator to the output sequence of data items
+  //! @param[in] d_num_items
+  //!   Pointer to the actual number of items in device-accessible memory
+  //! @param[in] max_num_items
+  //!   Maximum number of items (upper bound, used for resource sizing)
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within. Default is stream\ :sub:`0`.
+  template <typename InputIteratorT, typename OutputIteratorT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t ExclusiveSum(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    InputIteratorT d_in,
+    OutputIteratorT d_out,
+    const NumItemsT* d_num_items,
+    NumItemsT max_num_items,
+    cudaStream_t stream = 0)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceScan::ExclusiveSum");
+
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+    using InitT   = cub::detail::it_value_t<InputIteratorT>;
+
+    InitT init_value{};
+
+    return detail::scan::dispatch_indirect(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_in,
+      d_out,
+      ::cuda::std::plus<>{},
+      detail::InputValue<InitT>(init_value),
+      reinterpret_cast<const OffsetT*>(d_num_items),
+      static_cast<OffsetT>(max_num_items),
+      stream);
+  }
+
+  //! @brief Computes a device-wide inclusive prefix sum where the number of items is stored in device memory.
+  //!
+  //! This overload enables CUDA graph capture for variable-length scan problems.
+  //!
+  //! @param[in] d_temp_storage
+  //!   Device-accessible allocation of temporary storage. When `nullptr`, the
+  //!   required allocation size is written to `temp_storage_bytes` and no work is done.
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of `d_temp_storage` allocation
+  //! @param[in] d_in
+  //!   Random-access iterator to the input sequence of data items
+  //! @param[out] d_out
+  //!   Random-access iterator to the output sequence of data items
+  //! @param[in] d_num_items
+  //!   Pointer to the actual number of items in device-accessible memory
+  //! @param[in] max_num_items
+  //!   Maximum number of items (upper bound, used for resource sizing)
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within. Default is stream\ :sub:`0`.
+  template <typename InputIteratorT, typename OutputIteratorT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t InclusiveSum(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    InputIteratorT d_in,
+    OutputIteratorT d_out,
+    const NumItemsT* d_num_items,
+    NumItemsT max_num_items,
+    cudaStream_t stream = 0)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceScan::InclusiveSum");
+
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    return detail::scan::dispatch_indirect(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_in,
+      d_out,
+      ::cuda::std::plus<>{},
+      NullType{},
+      reinterpret_cast<const OffsetT*>(d_num_items),
+      static_cast<OffsetT>(max_num_items),
+      stream);
+  }
+
+  //! @brief Computes a device-wide exclusive prefix scan where the number of items is stored in device memory.
+  //!
+  //! This overload enables CUDA graph capture for variable-length scan problems.
+  //!
+  //! @param[in] d_temp_storage
+  //!   Device-accessible allocation of temporary storage. When `nullptr`, the
+  //!   required allocation size is written to `temp_storage_bytes` and no work is done.
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of `d_temp_storage` allocation
+  //! @param[in] d_in
+  //!   Random-access iterator to the input sequence of data items
+  //! @param[out] d_out
+  //!   Random-access iterator to the output sequence of data items
+  //! @param[in] scan_op
+  //!   Binary associative scan functor
+  //! @param[in] init_value
+  //!   Initial value to seed the exclusive scan
+  //! @param[in] d_num_items
+  //!   Pointer to the actual number of items in device-accessible memory
+  //! @param[in] max_num_items
+  //!   Maximum number of items (upper bound, used for resource sizing)
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within. Default is stream\ :sub:`0`.
+  template <typename InputIteratorT, typename OutputIteratorT, typename ScanOpT, typename InitValueT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t ExclusiveScan(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    InputIteratorT d_in,
+    OutputIteratorT d_out,
+    ScanOpT scan_op,
+    InitValueT init_value,
+    const NumItemsT* d_num_items,
+    NumItemsT max_num_items,
+    cudaStream_t stream = 0)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceScan::ExclusiveScan");
+
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    return detail::scan::dispatch_indirect(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_in,
+      d_out,
+      scan_op,
+      detail::InputValue<InitValueT>(init_value),
+      reinterpret_cast<const OffsetT*>(d_num_items),
+      static_cast<OffsetT>(max_num_items),
+      stream);
+  }
+
+  //! @brief Computes a device-wide inclusive prefix scan where the number of items is stored in device memory.
+  //!
+  //! This overload enables CUDA graph capture for variable-length scan problems.
+  //!
+  //! @param[in] d_temp_storage
+  //!   Device-accessible allocation of temporary storage. When `nullptr`, the
+  //!   required allocation size is written to `temp_storage_bytes` and no work is done.
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of `d_temp_storage` allocation
+  //! @param[in] d_in
+  //!   Random-access iterator to the input sequence of data items
+  //! @param[out] d_out
+  //!   Random-access iterator to the output sequence of data items
+  //! @param[in] scan_op
+  //!   Binary associative scan functor
+  //! @param[in] d_num_items
+  //!   Pointer to the actual number of items in device-accessible memory
+  //! @param[in] max_num_items
+  //!   Maximum number of items (upper bound, used for resource sizing)
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within. Default is stream\ :sub:`0`.
+  template <typename InputIteratorT, typename OutputIteratorT, typename ScanOpT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t InclusiveScan(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    InputIteratorT d_in,
+    OutputIteratorT d_out,
+    ScanOpT scan_op,
+    const NumItemsT* d_num_items,
+    NumItemsT max_num_items,
+    cudaStream_t stream = 0)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceScan::InclusiveScan");
+
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    return detail::scan::dispatch_indirect(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_in,
+      d_out,
+      scan_op,
+      NullType{},
+      reinterpret_cast<const OffsetT*>(d_num_items),
+      static_cast<OffsetT>(max_num_items),
+      stream);
+  }
+
+  //! @}
+
   //! @name Scans by key
   //! @{
 

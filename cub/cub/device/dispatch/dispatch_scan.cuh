@@ -149,6 +149,39 @@ struct DeviceScanKernelSource
   }
 };
 
+template <typename PolicySelector,
+          typename UnwrappedInputIteratorT,
+          typename UnwrappedOutputIteratorT,
+          typename ScanOpT,
+          typename InitValueT,
+          typename OffsetT,
+          typename AccumT,
+          ForceInclusive EnforceInclusive>
+struct DeviceScanIndirectKernelSource
+    : DeviceScanKernelSource<PolicySelector,
+                             UnwrappedInputIteratorT,
+                             UnwrappedOutputIteratorT,
+                             ScanOpT,
+                             InitValueT,
+                             OffsetT,
+                             AccumT,
+                             EnforceInclusive>
+{
+  using ScanTileStateT = ScanTileState<AccumT>;
+
+  CUB_DEFINE_KERNEL_GETTER(
+    IndirectScanKernel,
+    DeviceScanIndirectKernel<PolicySelector,
+                             UnwrappedInputIteratorT,
+                             UnwrappedOutputIteratorT,
+                             ScanTileStateT,
+                             ScanOpT,
+                             InitValueT,
+                             OffsetT,
+                             AccumT,
+                             EnforceInclusive == ForceInclusive::Yes>)
+};
+
 // TODO(griwes): remove in CCCL 4.0 when we drop the scan dispatcher after publishing the tuning API
 template <typename LegacyActivePolicy>
 _CCCL_API constexpr auto convert_policy() -> scan_policy
@@ -1045,6 +1078,182 @@ CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE auto dispatch_with_accum(
     policy_selector,
     kernel_source,
     launcher_factory);
+}
+/**
+ * @brief Wraps a policy selector to always force the lookback algorithm.
+ *
+ * When the underlying selector returns warpspeed for a given arch, this wrapper
+ * falls back to the lookback policy for the nearest lower arch that uses lookback.
+ * This is needed for indirect scan which only supports the lookback algorithm.
+ */
+template <typename InnerSelector>
+struct lookback_only_policy_selector : InnerSelector
+{
+  _CCCL_API constexpr auto operator()(::cuda::arch_id arch) const -> scan_policy
+  {
+    auto policy = InnerSelector::operator()(arch);
+    if (policy.algorithm == scan_algorithm::warpspeed)
+    {
+      policy = InnerSelector::operator()(::cuda::arch_id::sm_90);
+    }
+    return policy;
+  }
+};
+
+/**
+ * @brief Dispatch for indirect (device-accessible) num_items scan.
+ *
+ * Uses max_num_items for host-side resource sizing (temp storage, grid dimensions)
+ * and passes d_num_items (device pointer) to the kernel for the actual item count.
+ * Only the lookback algorithm is supported (not warpspeed).
+ */
+template <
+  ForceInclusive EnforceInclusive = ForceInclusive::No,
+  typename InputIteratorT,
+  typename OutputIteratorT,
+  typename ScanOpT,
+  typename InitValueT,
+  typename OffsetT,
+  typename AccumT             = ::cuda::std::__accumulator_t<ScanOpT,
+                                                             cub::detail::it_value_t<InputIteratorT>,
+                                                             ::cuda::std::_If<::cuda::std::is_same_v<InitValueT, NullType>,
+                                                                              cub::detail::it_value_t<InputIteratorT>,
+                                                                              typename InitValueT::value_type>>,
+  typename BasePolicySelector = policy_selector_from_types<InputIteratorT, OutputIteratorT, AccumT, OffsetT, ScanOpT>,
+  typename PolicySelector     = lookback_only_policy_selector<BasePolicySelector>,
+  typename KernelSource       = DeviceScanIndirectKernelSource<
+          PolicySelector,
+          THRUST_NS_QUALIFIER::try_unwrap_contiguous_iterator_t<InputIteratorT>,
+          THRUST_NS_QUALIFIER::try_unwrap_contiguous_iterator_t<OutputIteratorT>,
+          ScanOpT,
+          InitValueT,
+          OffsetT,
+          AccumT,
+          EnforceInclusive>,
+  typename KernelLauncherFactory = CUB_DETAIL_DEFAULT_KERNEL_LAUNCHER_FACTORY>
+CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE auto dispatch_indirect(
+  void* d_temp_storage,
+  size_t& temp_storage_bytes,
+  InputIteratorT d_in,
+  OutputIteratorT d_out,
+  ScanOpT scan_op,
+  InitValueT init_value,
+  const OffsetT* d_num_items,
+  OffsetT max_num_items,
+  cudaStream_t stream,
+  PolicySelector policy_selector         = {},
+  KernelSource kernel_source             = {},
+  KernelLauncherFactory launcher_factory = {}) -> cudaError_t
+{
+  static_assert(::cuda::std::is_unsigned_v<OffsetT> && sizeof(OffsetT) >= 4,
+                "dispatch_indirect only supports unsigned offset types of at least 4-bytes");
+
+  ::cuda::arch_id arch_id{};
+  if (const auto error = CubDebug(launcher_factory.PtxArchId(arch_id)))
+  {
+    return error;
+  }
+
+  struct fake_policy
+  {
+    using MaxPolicy = void;
+  };
+
+  return dispatch_arch(policy_selector, arch_id, [&](auto policy_getter) -> cudaError_t {
+    CUB_DETAIL_CONSTEXPR_ISH const scan_lookback_policy active_policy = policy_getter().lookback;
+
+    const int tile_size = active_policy.block_threads * active_policy.items_per_thread;
+    const int num_tiles = static_cast<int>(::cuda::ceil_div(max_num_items, tile_size));
+
+    auto tile_state = kernel_source.TileState();
+
+    size_t allocation_sizes[1];
+    if (const auto error = CubDebug(tile_state.AllocationSize(num_tiles, allocation_sizes[0])))
+    {
+      return error;
+    }
+
+    void* allocations[1] = {};
+    if (const auto error =
+          CubDebug(detail::alias_temporaries(d_temp_storage, temp_storage_bytes, allocations, allocation_sizes)))
+    {
+      return error;
+    }
+
+    if (d_temp_storage == nullptr || max_num_items == 0)
+    {
+      return cudaSuccess;
+    }
+
+    if (const auto error = CubDebug(tile_state.Init(num_tiles, allocations[0], allocation_sizes[0])))
+    {
+      return error;
+    }
+
+    constexpr int init_kernel_threads = 128;
+    const int init_grid_size          = ::cuda::ceil_div(num_tiles, init_kernel_threads);
+
+    if (const auto error = CubDebug(
+          launcher_factory(init_grid_size, init_kernel_threads, 0, stream, /* use_pdl */ true)
+            .doit(kernel_source.InitKernel(), kernel_source.make_tile_state_kernel_arg(tile_state), num_tiles)))
+    {
+      return error;
+    }
+
+    if (const auto error = CubDebug(cudaPeekAtLastError()))
+    {
+      return error;
+    }
+
+    if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+    {
+      return error;
+    }
+
+    int scan_sm_occupancy;
+    if (const auto error = CubDebug(launcher_factory.MaxSmOccupancy(
+          scan_sm_occupancy, kernel_source.IndirectScanKernel(), active_policy.block_threads)))
+    {
+      return error;
+    }
+
+    int max_dim_x;
+    if (const auto error = CubDebug(launcher_factory.MaxGridDimX(max_dim_x)))
+    {
+      return error;
+    }
+
+    const int scan_grid_size = ::cuda::std::min(num_tiles, max_dim_x);
+    for (int start_tile = 0; start_tile < num_tiles; start_tile += scan_grid_size)
+    {
+      if (const auto error = CubDebug(
+            launcher_factory(scan_grid_size, active_policy.block_threads, 0, stream, /* use_pdl */ true)
+              .doit(kernel_source.IndirectScanKernel(),
+                    THRUST_NS_QUALIFIER::try_unwrap_contiguous_iterator(d_in),
+                    THRUST_NS_QUALIFIER::try_unwrap_contiguous_iterator(d_out),
+                    kernel_source.make_tile_state_kernel_arg(tile_state),
+                    start_tile,
+                    scan_op,
+                    init_value,
+                    d_num_items,
+                    /* num_stages, unused */ 1)))
+      {
+        return error;
+      }
+
+      if (const auto error = CubDebug(cudaPeekAtLastError()))
+      {
+        return error;
+      }
+
+      if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+      {
+        return error;
+      }
+    }
+
+    return cudaSuccess;
+  });
 }
 } // namespace detail::scan
 
