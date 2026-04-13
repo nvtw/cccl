@@ -3460,3 +3460,193 @@ TEST_CASE("DeviceRadixSort::SortKeys indirect int64_t descending", "[radix_sort]
 
   verify_indirect_sort_keys(h_keys, max_num_items, actual_num_items, true);
 }
+
+// ============================================================================
+// THE REAL USE CASE: kernel writes d_num_items, sort reads it, all in one graph
+// This simulates physics engine: count contacts -> sort contact pairs
+// ============================================================================
+
+__global__ void write_count_kernel(int* d_num_items, const int* d_source)
+{
+  if (threadIdx.x == 0 && blockIdx.x == 0)
+  {
+    *d_num_items = *d_source;
+  }
+}
+
+TEST_CASE(
+  "DeviceRadixSort::SortPairs graph with kernel-written d_num_items", "[radix_sort][indirect][device][graph]")
+{
+  constexpr int max_num_items = 50000;
+
+  std::mt19937 rng(42);
+  std::uniform_int_distribution<int> key_dist(0, 100000);
+  std::vector<int> h_keys(max_num_items);
+  std::vector<int> h_values(max_num_items);
+  for (int i = 0; i < max_num_items; ++i)
+  {
+    h_keys[i]   = key_dist(rng);
+    h_values[i] = i;
+  }
+
+  thrust::device_vector<int> d_keys_in(h_keys.begin(), h_keys.end());
+  thrust::device_vector<int> d_keys_out(max_num_items, -1);
+  thrust::device_vector<int> d_values_in(h_values.begin(), h_values.end());
+  thrust::device_vector<int> d_values_out(max_num_items, -1);
+
+  thrust::device_vector<int> d_num_items_vec(1, 0);
+  int* d_num_items = thrust::raw_pointer_cast(d_num_items_vec.data());
+  thrust::device_vector<int> d_count_source(1, 0);
+  int* d_count_ptr = thrust::raw_pointer_cast(d_count_source.data());
+
+  void* d_temp_storage      = nullptr;
+  size_t temp_storage_bytes = 0;
+  REQUIRE(
+    cudaSuccess
+    == cub::DeviceRadixSort::SortPairs(
+      d_temp_storage, temp_storage_bytes,
+      thrust::raw_pointer_cast(d_keys_in.data()), thrust::raw_pointer_cast(d_keys_out.data()),
+      thrust::raw_pointer_cast(d_values_in.data()), thrust::raw_pointer_cast(d_values_out.data()),
+      static_cast<const int*>(d_num_items), max_num_items,
+      0, static_cast<int>(sizeof(int) * 8)));
+
+  thrust::device_vector<std::uint8_t> d_temp(temp_storage_bytes);
+  d_temp_storage = thrust::raw_pointer_cast(d_temp.data());
+
+  cudaStream_t stream{};
+  REQUIRE(cudaSuccess == cudaStreamCreate(&stream));
+  cudaGraph_t graph{};
+  REQUIRE(cudaSuccess == cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+
+  write_count_kernel<<<1, 1, 0, stream>>>(d_num_items, d_count_ptr);
+
+  REQUIRE(
+    cudaSuccess
+    == cub::DeviceRadixSort::SortPairs(
+      d_temp_storage, temp_storage_bytes,
+      thrust::raw_pointer_cast(d_keys_in.data()), thrust::raw_pointer_cast(d_keys_out.data()),
+      thrust::raw_pointer_cast(d_values_in.data()), thrust::raw_pointer_cast(d_values_out.data()),
+      static_cast<const int*>(d_num_items), max_num_items,
+      0, static_cast<int>(sizeof(int) * 8), stream));
+
+  REQUIRE(cudaSuccess == cudaStreamEndCapture(stream, &graph));
+  cudaGraphExec_t exec{};
+  REQUIRE(cudaSuccess == cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+
+  for (int n : {0, 1, 42, 1000, 10000, 50000, 500, 7, 49999})
+  {
+    d_count_source[0] = n;
+    thrust::fill(d_keys_out.begin(), d_keys_out.end(), -1);
+    thrust::fill(d_values_out.begin(), d_values_out.end(), -1);
+    REQUIRE(cudaSuccess == cudaDeviceSynchronize());
+
+    REQUIRE(cudaSuccess == cudaGraphLaunch(exec, stream));
+    REQUIRE(cudaSuccess == cudaStreamSynchronize(stream));
+
+    std::vector<int> ref_keys, ref_values;
+    sort_pairs_reference(h_keys, h_values, ref_keys, ref_values, n, false);
+
+    thrust::host_vector<int> h_keys_out(d_keys_out);
+    thrust::host_vector<int> h_values_out(d_values_out);
+    for (int i = 0; i < n; ++i)
+    {
+      REQUIRE(h_keys_out[i] == ref_keys[i]);
+      REQUIRE(h_values_out[i] == ref_values[i]);
+    }
+  }
+
+  REQUIRE(cudaSuccess == cudaGraphExecDestroy(exec));
+  REQUIRE(cudaSuccess == cudaGraphDestroy(graph));
+  REQUIRE(cudaSuccess == cudaStreamDestroy(stream));
+}
+
+TEST_CASE(
+  "DeviceRadixSort graph kernel-written d_num_items stress 200 iters",
+  "[radix_sort][indirect][device][graph][stress]")
+{
+  constexpr int max_num_items = 100000;
+
+  std::mt19937 data_rng(42);
+  std::uniform_int_distribution<int> key_dist(0, 1000000);
+  std::vector<int> h_keys(max_num_items);
+  std::vector<int> h_values(max_num_items);
+  for (int i = 0; i < max_num_items; ++i)
+  {
+    h_keys[i]   = key_dist(data_rng);
+    h_values[i] = i;
+  }
+
+  thrust::device_vector<int> d_keys_in(h_keys.begin(), h_keys.end());
+  thrust::device_vector<int> d_keys_out(max_num_items, -1);
+  thrust::device_vector<int> d_values_in(h_values.begin(), h_values.end());
+  thrust::device_vector<int> d_values_out(max_num_items, -1);
+
+  thrust::device_vector<int> d_num_items_vec(1, 0);
+  int* d_num_items = thrust::raw_pointer_cast(d_num_items_vec.data());
+  thrust::device_vector<int> d_count_source(1, 0);
+  int* d_count_ptr = thrust::raw_pointer_cast(d_count_source.data());
+
+  void* d_temp_storage      = nullptr;
+  size_t temp_storage_bytes = 0;
+  REQUIRE(
+    cudaSuccess
+    == cub::DeviceRadixSort::SortPairs(
+      d_temp_storage, temp_storage_bytes,
+      thrust::raw_pointer_cast(d_keys_in.data()), thrust::raw_pointer_cast(d_keys_out.data()),
+      thrust::raw_pointer_cast(d_values_in.data()), thrust::raw_pointer_cast(d_values_out.data()),
+      static_cast<const int*>(d_num_items), max_num_items,
+      0, static_cast<int>(sizeof(int) * 8)));
+
+  thrust::device_vector<std::uint8_t> d_temp(temp_storage_bytes);
+  d_temp_storage = thrust::raw_pointer_cast(d_temp.data());
+
+  cudaStream_t stream{};
+  REQUIRE(cudaSuccess == cudaStreamCreate(&stream));
+  cudaGraph_t graph{};
+  REQUIRE(cudaSuccess == cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+
+  write_count_kernel<<<1, 1, 0, stream>>>(d_num_items, d_count_ptr);
+
+  REQUIRE(
+    cudaSuccess
+    == cub::DeviceRadixSort::SortPairs(
+      d_temp_storage, temp_storage_bytes,
+      thrust::raw_pointer_cast(d_keys_in.data()), thrust::raw_pointer_cast(d_keys_out.data()),
+      thrust::raw_pointer_cast(d_values_in.data()), thrust::raw_pointer_cast(d_values_out.data()),
+      static_cast<const int*>(d_num_items), max_num_items,
+      0, static_cast<int>(sizeof(int) * 8), stream));
+
+  REQUIRE(cudaSuccess == cudaStreamEndCapture(stream, &graph));
+  cudaGraphExec_t exec{};
+  REQUIRE(cudaSuccess == cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+
+  std::mt19937 size_rng(7);
+  std::uniform_int_distribution<int> size_dist(0, max_num_items);
+
+  for (int iter = 0; iter < 200; ++iter)
+  {
+    int n             = size_dist(size_rng);
+    d_count_source[0] = n;
+    thrust::fill(d_keys_out.begin(), d_keys_out.end(), -1);
+    thrust::fill(d_values_out.begin(), d_values_out.end(), -1);
+    REQUIRE(cudaSuccess == cudaDeviceSynchronize());
+
+    REQUIRE(cudaSuccess == cudaGraphLaunch(exec, stream));
+    REQUIRE(cudaSuccess == cudaStreamSynchronize(stream));
+
+    std::vector<int> ref_keys, ref_values;
+    sort_pairs_reference(h_keys, h_values, ref_keys, ref_values, n, false);
+
+    thrust::host_vector<int> h_keys_out(d_keys_out);
+    thrust::host_vector<int> h_values_out(d_values_out);
+    for (int i = 0; i < n; ++i)
+    {
+      REQUIRE(h_keys_out[i] == ref_keys[i]);
+      REQUIRE(h_values_out[i] == ref_values[i]);
+    }
+  }
+
+  REQUIRE(cudaSuccess == cudaGraphExecDestroy(exec));
+  REQUIRE(cudaSuccess == cudaGraphDestroy(graph));
+  REQUIRE(cudaSuccess == cudaStreamDestroy(stream));
+}

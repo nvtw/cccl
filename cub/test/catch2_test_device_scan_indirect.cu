@@ -3060,3 +3060,146 @@ TEST_CASE(
   REQUIRE(cudaSuccess == cudaGraphDestroy(graph));
   REQUIRE(cudaSuccess == cudaStreamDestroy(stream));
 }
+
+// ============================================================================
+// THE REAL USE CASE: kernel writes d_num_items, scan reads it, all in one graph
+// This simulates physics engine contact counting -> scan pattern
+// ============================================================================
+
+__global__ void write_num_items_kernel(int* d_num_items, const int* d_count_source)
+{
+  if (threadIdx.x == 0 && blockIdx.x == 0)
+  {
+    *d_num_items = *d_count_source;
+  }
+}
+
+TEST_CASE("DeviceScan::ExclusiveSum graph with kernel-written d_num_items", "[scan][indirect][device][graph]")
+{
+  constexpr int max_num_items = 50000;
+
+  std::vector<int> h_in(max_num_items, 1);
+  thrust::device_vector<int> d_in(h_in.begin(), h_in.end());
+  thrust::device_vector<int> d_out(max_num_items, -1);
+
+  thrust::device_vector<int> d_num_items_vec(1, 0);
+  int* d_num_items = thrust::raw_pointer_cast(d_num_items_vec.data());
+  thrust::device_vector<int> d_count_source(1, 0);
+  int* d_count_ptr = thrust::raw_pointer_cast(d_count_source.data());
+
+  void* d_temp_storage      = nullptr;
+  size_t temp_storage_bytes = 0;
+  REQUIRE(
+    cudaSuccess
+    == cub::DeviceScan::ExclusiveSum(
+      d_temp_storage, temp_storage_bytes,
+      thrust::raw_pointer_cast(d_in.data()), thrust::raw_pointer_cast(d_out.data()),
+      static_cast<const int*>(d_num_items), max_num_items));
+
+  thrust::device_vector<std::uint8_t> d_temp(temp_storage_bytes);
+  d_temp_storage = thrust::raw_pointer_cast(d_temp.data());
+
+  cudaStream_t stream{};
+  REQUIRE(cudaSuccess == cudaStreamCreate(&stream));
+  cudaGraph_t graph{};
+  REQUIRE(cudaSuccess == cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+
+  write_num_items_kernel<<<1, 1, 0, stream>>>(d_num_items, d_count_ptr);
+
+  REQUIRE(
+    cudaSuccess
+    == cub::DeviceScan::ExclusiveSum(
+      d_temp_storage, temp_storage_bytes,
+      thrust::raw_pointer_cast(d_in.data()), thrust::raw_pointer_cast(d_out.data()),
+      static_cast<const int*>(d_num_items), max_num_items, stream));
+
+  REQUIRE(cudaSuccess == cudaStreamEndCapture(stream, &graph));
+  cudaGraphExec_t exec{};
+  REQUIRE(cudaSuccess == cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+
+  for (int n : {0, 1, 42, 1000, 10000, 50000, 500, 7, 49999})
+  {
+    d_count_source[0] = n;
+    thrust::fill(d_out.begin(), d_out.end(), -1);
+    REQUIRE(cudaSuccess == cudaDeviceSynchronize());
+    REQUIRE(cudaSuccess == cudaGraphLaunch(exec, stream));
+    REQUIRE(cudaSuccess == cudaStreamSynchronize(stream));
+
+    thrust::host_vector<int> h_out(d_out);
+    for (int i = 0; i < n; ++i)
+    {
+      REQUIRE(h_out[i] == i);
+    }
+  }
+
+  REQUIRE(cudaSuccess == cudaGraphExecDestroy(exec));
+  REQUIRE(cudaSuccess == cudaGraphDestroy(graph));
+  REQUIRE(cudaSuccess == cudaStreamDestroy(stream));
+}
+
+TEST_CASE(
+  "DeviceScan graph kernel-written d_num_items stress 200 iters", "[scan][indirect][device][graph][stress]")
+{
+  constexpr int max_num_items = 100000;
+
+  std::vector<int> h_in(max_num_items, 1);
+  thrust::device_vector<int> d_in(h_in.begin(), h_in.end());
+  thrust::device_vector<int> d_out(max_num_items, -1);
+  thrust::device_vector<int> d_num_items_vec(1, 0);
+  int* d_num_items = thrust::raw_pointer_cast(d_num_items_vec.data());
+  thrust::device_vector<int> d_count_source(1, 0);
+  int* d_count_ptr = thrust::raw_pointer_cast(d_count_source.data());
+
+  void* d_temp_storage      = nullptr;
+  size_t temp_storage_bytes = 0;
+  REQUIRE(
+    cudaSuccess
+    == cub::DeviceScan::ExclusiveSum(
+      d_temp_storage, temp_storage_bytes,
+      thrust::raw_pointer_cast(d_in.data()), thrust::raw_pointer_cast(d_out.data()),
+      static_cast<const int*>(d_num_items), max_num_items));
+
+  thrust::device_vector<std::uint8_t> d_temp(temp_storage_bytes);
+  d_temp_storage = thrust::raw_pointer_cast(d_temp.data());
+
+  cudaStream_t stream{};
+  REQUIRE(cudaSuccess == cudaStreamCreate(&stream));
+  cudaGraph_t graph{};
+  REQUIRE(cudaSuccess == cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+
+  write_num_items_kernel<<<1, 1, 0, stream>>>(d_num_items, d_count_ptr);
+
+  REQUIRE(
+    cudaSuccess
+    == cub::DeviceScan::ExclusiveSum(
+      d_temp_storage, temp_storage_bytes,
+      thrust::raw_pointer_cast(d_in.data()), thrust::raw_pointer_cast(d_out.data()),
+      static_cast<const int*>(d_num_items), max_num_items, stream));
+
+  REQUIRE(cudaSuccess == cudaStreamEndCapture(stream, &graph));
+  cudaGraphExec_t exec{};
+  REQUIRE(cudaSuccess == cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+
+  std::mt19937 rng(42);
+  std::uniform_int_distribution<int> dist(0, max_num_items);
+
+  for (int iter = 0; iter < 200; ++iter)
+  {
+    int n             = dist(rng);
+    d_count_source[0] = n;
+    thrust::fill(d_out.begin(), d_out.end(), -1);
+    REQUIRE(cudaSuccess == cudaDeviceSynchronize());
+    REQUIRE(cudaSuccess == cudaGraphLaunch(exec, stream));
+    REQUIRE(cudaSuccess == cudaStreamSynchronize(stream));
+
+    thrust::host_vector<int> h_out(d_out);
+    for (int i = 0; i < n; ++i)
+    {
+      REQUIRE(h_out[i] == i);
+    }
+  }
+
+  REQUIRE(cudaSuccess == cudaGraphExecDestroy(exec));
+  REQUIRE(cudaSuccess == cudaGraphDestroy(graph));
+  REQUIRE(cudaSuccess == cudaStreamDestroy(stream));
+}
