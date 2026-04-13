@@ -5171,7 +5171,7 @@ public:
 
     using OffsetT = detail::choose_offset_t<NumItemsT>;
 
-    return detail::radix_sort::dispatch_indirect<detail::radix_sort::SortOrder::Ascending>(
+    return detail::radix_sort::dispatch_indirect<SortOrder::Ascending>(
       d_temp_storage,
       temp_storage_bytes,
       d_keys_in,
@@ -5210,7 +5210,7 @@ public:
 
     using OffsetT = detail::choose_offset_t<NumItemsT>;
 
-    return detail::radix_sort::dispatch_indirect<detail::radix_sort::SortOrder::Descending>(
+    return detail::radix_sort::dispatch_indirect<SortOrder::Descending>(
       d_temp_storage,
       temp_storage_bytes,
       d_keys_in,
@@ -5250,7 +5250,7 @@ public:
     constexpr NullType* d_values_in  = nullptr;
     constexpr NullType* d_values_out = nullptr;
 
-    return detail::radix_sort::dispatch_indirect<detail::radix_sort::SortOrder::Ascending>(
+    return detail::radix_sort::dispatch_indirect<SortOrder::Ascending>(
       d_temp_storage,
       temp_storage_bytes,
       d_keys_in,
@@ -5290,7 +5290,7 @@ public:
     constexpr NullType* d_values_in  = nullptr;
     constexpr NullType* d_values_out = nullptr;
 
-    return detail::radix_sort::dispatch_indirect<detail::radix_sort::SortOrder::Descending>(
+    return detail::radix_sort::dispatch_indirect<SortOrder::Descending>(
       d_temp_storage,
       temp_storage_bytes,
       d_keys_in,
