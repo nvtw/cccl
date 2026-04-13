@@ -85,6 +85,29 @@ struct DeviceRadixSortKernelSource
     RadixSortOnesweepKernel,
     DeviceRadixSortOnesweepKernel<PolicySelector, Order, KeyT, ValueT, OffsetT, int, int, DecomposerT>);
 
+  CUB_DEFINE_KERNEL_GETTER(RadixSortHistogramIndirectKernel,
+                           DeviceRadixSortHistogramIndirectKernel<PolicySelector, Order, KeyT, OffsetT, DecomposerT>);
+
+  CUB_DEFINE_KERNEL_GETTER(
+    RadixSortOnesweepIndirectKernel,
+    DeviceRadixSortOnesweepIndirectKernel<PolicySelector, Order, KeyT, ValueT, OffsetT, int, int, DecomposerT>);
+
+  CUB_DEFINE_KERNEL_GETTER(
+    RadixSortUpsweepIndirectKernel,
+    DeviceRadixSortUpsweepIndirectKernel<PolicySelector, false, Order, KeyT, OffsetT, DecomposerT>);
+
+  CUB_DEFINE_KERNEL_GETTER(
+    RadixSortAltUpsweepIndirectKernel,
+    DeviceRadixSortUpsweepIndirectKernel<PolicySelector, true, Order, KeyT, OffsetT, DecomposerT>);
+
+  CUB_DEFINE_KERNEL_GETTER(
+    RadixSortDownsweepIndirectKernel,
+    DeviceRadixSortDownsweepIndirectKernel<PolicySelector, false, Order, KeyT, ValueT, OffsetT, DecomposerT>);
+
+  CUB_DEFINE_KERNEL_GETTER(
+    RadixSortAltDownsweepIndirectKernel,
+    DeviceRadixSortDownsweepIndirectKernel<PolicySelector, true, Order, KeyT, ValueT, OffsetT, DecomposerT>);
+
   CUB_RUNTIME_FUNCTION static constexpr size_t KeySize()
   {
     return sizeof(KeyT);
@@ -1232,6 +1255,471 @@ CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE cudaError_t dispatch(
       kernel_source,
       launcher_factory}
       .__invoke(policy_getter);
+  });
+}
+template <SortOrder Order,
+          typename KeyT,
+          typename ValueT,
+          typename OffsetT,
+          typename DecomposerT    = identity_decomposer_t,
+          typename PolicySelector = policy_selector_from_types<KeyT, ValueT, OffsetT>,
+          typename KernelSource = DeviceRadixSortKernelSource<PolicySelector, Order, KeyT, ValueT, OffsetT, DecomposerT>,
+          typename KernelLauncherFactory = CUB_DETAIL_DEFAULT_KERNEL_LAUNCHER_FACTORY>
+CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE cudaError_t dispatch_indirect(
+  void* d_temp_storage,
+  size_t& temp_storage_bytes,
+  const KeyT* d_keys_in,
+  KeyT* d_keys_out,
+  const ValueT* d_values_in,
+  ValueT* d_values_out,
+  const OffsetT* d_num_items,
+  OffsetT max_num_items,
+  int begin_bit,
+  int end_bit,
+  cudaStream_t stream,
+  DecomposerT decomposer                 = {},
+  PolicySelector policy_selector         = {},
+  KernelSource kernel_source             = {},
+  KernelLauncherFactory launcher_factory = {})
+{
+  static_assert(::cuda::std::is_unsigned_v<OffsetT> && sizeof(OffsetT) >= 4,
+                "dispatch_indirect only supports unsigned offset types of at least 4-bytes");
+
+  constexpr bool KEYS_ONLY = ::cuda::std::is_same_v<ValueT, NullType>;
+
+  ::cuda::arch_id arch_id{};
+  if (const auto error = CubDebug(launcher_factory.PtxArchId(arch_id)))
+  {
+    return error;
+  }
+
+  return dispatch_arch(policy_selector, arch_id, [&](auto policy_getter) -> cudaError_t {
+    CUB_DETAIL_CONSTEXPR_ISH auto policy = policy_getter();
+
+    if (max_num_items == 0 || begin_bit == end_bit)
+    {
+      if (d_temp_storage == nullptr)
+      {
+        temp_storage_bytes = 1;
+      }
+      return cudaSuccess;
+    }
+
+    // is_overwrite_okay = false for separate in/out API
+    constexpr bool is_overwrite_okay = false;
+
+    // Set up DoubleBuffer for internal use
+    DoubleBuffer<KeyT> d_keys(const_cast<KeyT*>(d_keys_in), d_keys_out);
+    DoubleBuffer<ValueT> d_values(const_cast<ValueT*>(d_values_in), d_values_out);
+
+#if _CCCL_COMPILER(GCC, <, 10)
+    if CUB_DETAIL_CONSTEXPR_ISH (decltype(policy_getter){}().use_onesweep)
+#else
+    if CUB_DETAIL_CONSTEXPR_ISH (policy.use_onesweep)
+#endif
+    {
+      // ===== Onesweep indirect path =====
+      using PortionOffsetT = int;
+      using AtomicOffsetT  = PortionOffsetT;
+
+      const int RADIX_BITS                = policy.onesweep.radix_bits;
+      const int RADIX_DIGITS              = 1 << RADIX_BITS;
+      const int ONESWEEP_ITEMS_PER_THREAD = policy.onesweep.items_per_thread;
+      const int ONESWEEP_BLOCK_THREADS    = policy.onesweep.block_threads;
+      const int ONESWEEP_TILE_ITEMS       = ONESWEEP_ITEMS_PER_THREAD * ONESWEEP_BLOCK_THREADS;
+      const PortionOffsetT PORTION_SIZE   = ((1 << 28) - 1) / ONESWEEP_TILE_ITEMS * ONESWEEP_TILE_ITEMS;
+      int num_passes                      = ::cuda::ceil_div(end_bit - begin_bit, RADIX_BITS);
+      OffsetT max_num_portions            = static_cast<OffsetT>(::cuda::ceil_div(max_num_items, PORTION_SIZE));
+      PortionOffsetT max_num_blocks       = ::cuda::ceil_div(
+        static_cast<int>(::cuda::std::min(max_num_items, static_cast<OffsetT>(PORTION_SIZE))), ONESWEEP_TILE_ITEMS);
+
+      size_t value_size         = KEYS_ONLY ? 0 : kernel_source.ValueSize();
+      size_t allocation_sizes[] = {
+        // bins
+        max_num_portions * num_passes * RADIX_DIGITS * sizeof(OffsetT),
+        // lookback
+        max_num_blocks * RADIX_DIGITS * sizeof(AtomicOffsetT),
+        // extra key buffer (is_overwrite_okay is false)
+        num_passes <= 1 ? 0 : max_num_items * kernel_source.KeySize(),
+        // extra value buffer
+        num_passes <= 1 ? 0 : max_num_items * value_size,
+        // counters (for agent tile assignment)
+        max_num_portions * num_passes * sizeof(AtomicOffsetT),
+        // pre-filter counters (one per portion*pass, to gate extra blocks)
+        max_num_portions * num_passes * sizeof(AtomicOffsetT),
+      };
+      constexpr int NUM_ALLOCATIONS      = sizeof(allocation_sizes) / sizeof(allocation_sizes[0]);
+      void* allocations[NUM_ALLOCATIONS] = {};
+      if (const auto error = CubDebug(detail::alias_temporaries<NUM_ALLOCATIONS>(
+            d_temp_storage, temp_storage_bytes, allocations, allocation_sizes)))
+      {
+        return error;
+      }
+
+      if (d_temp_storage == nullptr)
+      {
+        return cudaSuccess;
+      }
+
+      OffsetT* d_bins                  = (OffsetT*) allocations[0];
+      AtomicOffsetT* d_lookback        = (AtomicOffsetT*) allocations[1];
+      KeyT* d_keys_tmp2                = (KeyT*) allocations[2];
+      ValueT* d_values_tmp2            = (ValueT*) allocations[3];
+      AtomicOffsetT* d_ctrs            = (AtomicOffsetT*) allocations[4];
+      AtomicOffsetT* d_pre_filter_ctrs = (AtomicOffsetT*) allocations[5];
+
+      // Memset counters for all portions
+      if (const auto error =
+            CubDebug(cudaMemsetAsync(d_ctrs, 0, max_num_portions * num_passes * sizeof(AtomicOffsetT), stream)))
+      {
+        return error;
+      }
+
+      // Memset pre-filter counters
+      if (const auto error = CubDebug(
+            cudaMemsetAsync(d_pre_filter_ctrs, 0, max_num_portions * num_passes * sizeof(AtomicOffsetT), stream)))
+      {
+        return error;
+      }
+
+      // Memset bins for histogram
+      if (const auto error = CubDebug(cudaMemsetAsync(d_bins, 0, num_passes * RADIX_DIGITS * sizeof(OffsetT), stream)))
+      {
+        return error;
+      }
+
+      int device  = -1;
+      int num_sms = 0;
+      if (const auto error = CubDebug(cudaGetDevice(&device)))
+      {
+        return error;
+      }
+      if (const auto error = CubDebug(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device)))
+      {
+        return error;
+      }
+
+      const int HISTO_BLOCK_THREADS = policy.histogram.block_threads;
+      int histo_blocks_per_sm       = 1;
+      auto histogram_kernel         = kernel_source.RadixSortHistogramIndirectKernel();
+      if (const auto error =
+            CubDebug(launcher_factory.MaxSmOccupancy(histo_blocks_per_sm, histogram_kernel, HISTO_BLOCK_THREADS, 0)))
+      {
+        return error;
+      }
+
+      // Histogram kernel: grid is independent of num_items
+      if (const auto error = CubDebug(
+            launcher_factory(histo_blocks_per_sm * num_sms, HISTO_BLOCK_THREADS, 0, stream)
+              .doit(histogram_kernel, d_bins, d_keys.Current(), d_num_items, begin_bit, end_bit, decomposer)))
+      {
+        return error;
+      }
+
+      if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+      {
+        return error;
+      }
+
+      // Exclusive sum kernel: grid is num_passes, no num_items dependency
+      const int SCAN_BLOCK_THREADS = policy.exclusive_sum.block_threads;
+      if (const auto error = CubDebug(launcher_factory(num_passes, SCAN_BLOCK_THREADS, 0, stream)
+                                        .doit(kernel_source.RadixSortExclusiveSumKernel(), d_bins)))
+      {
+        return error;
+      }
+
+      if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+      {
+        return error;
+      }
+
+      // Buffer management (same logic as regular onesweep, depends only on num_passes)
+      KeyT* d_keys_tmp     = d_keys.Alternate();
+      ValueT* d_values_tmp = d_values.Alternate();
+      if (!is_overwrite_okay && num_passes % 2 == 0)
+      {
+        d_keys.d_buffers[1]   = d_keys_tmp2;
+        d_values.d_buffers[1] = d_values_tmp2;
+      }
+
+      for (int current_bit = begin_bit, pass = 0; current_bit < end_bit; current_bit += RADIX_BITS, ++pass)
+      {
+        int num_bits = ::cuda::std::min(end_bit - current_bit, RADIX_BITS);
+        for (OffsetT portion = 0; portion < max_num_portions; ++portion)
+        {
+          OffsetT portion_offset               = portion * PORTION_SIZE;
+          PortionOffsetT max_portion_num_items = static_cast<PortionOffsetT>(
+            ::cuda::std::min(max_num_items - portion_offset, static_cast<OffsetT>(PORTION_SIZE)));
+          PortionOffsetT max_portion_blocks = ::cuda::ceil_div(max_portion_num_items, ONESWEEP_TILE_ITEMS);
+
+          // Memset lookback for this portion (sized for max)
+          if (const auto error = CubDebug(
+                cudaMemsetAsync(d_lookback, 0, max_portion_blocks * RADIX_DIGITS * sizeof(AtomicOffsetT), stream)))
+          {
+            return error;
+          }
+
+          auto onesweep_kernel = kernel_source.RadixSortOnesweepIndirectKernel();
+
+          if (const auto error = CubDebug(
+                launcher_factory(max_portion_blocks, ONESWEEP_BLOCK_THREADS, 0, stream)
+                  .doit(onesweep_kernel,
+                        d_lookback,
+                        d_ctrs + portion * num_passes + pass,
+                        d_pre_filter_ctrs + portion * num_passes + pass,
+                        portion < max_num_portions - 1 ? d_bins + ((portion + 1) * num_passes + pass) * RADIX_DIGITS
+                                                       : nullptr,
+                        d_bins + (portion * num_passes + pass) * RADIX_DIGITS,
+                        d_keys.Alternate(),
+                        kernel_source.AdvanceKeys(d_keys.Current(), portion_offset),
+                        d_values.Alternate(),
+                        kernel_source.AdvanceValues(d_values.Current(), portion_offset),
+                        d_num_items,
+                        portion_offset,
+                        max_portion_num_items,
+                        current_bit,
+                        num_bits,
+                        decomposer)))
+          {
+            return error;
+          }
+
+          if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+          {
+            return error;
+          }
+        }
+
+        // Buffer swap (depends only on pass count, not num_items)
+        if (!is_overwrite_okay && pass == 0)
+        {
+          d_keys   = num_passes % 2 == 0 ? DoubleBuffer<KeyT>(d_keys_tmp, d_keys_tmp2)
+                                         : DoubleBuffer<KeyT>(d_keys_tmp2, d_keys_tmp);
+          d_values = num_passes % 2 == 0 ? DoubleBuffer<ValueT>(d_values_tmp, d_values_tmp2)
+                                         : DoubleBuffer<ValueT>(d_values_tmp2, d_values_tmp);
+        }
+        d_keys.selector ^= 1;
+        d_values.selector ^= 1;
+      }
+
+      return cudaSuccess;
+    }
+    else
+    {
+      // ===== Legacy multi-pass indirect path =====
+      int device_ordinal;
+      if (const auto error = CubDebug(cudaGetDevice(&device_ordinal)))
+      {
+        return error;
+      }
+
+      int sm_count;
+      if (const auto error =
+            CubDebug(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_ordinal)))
+      {
+        return error;
+      }
+
+      auto upsweep_kernel       = kernel_source.RadixSortUpsweepIndirectKernel();
+      auto alt_upsweep_kernel   = kernel_source.RadixSortAltUpsweepIndirectKernel();
+      auto scan_kernel          = kernel_source.DeviceRadixSortScanBinsKernel();
+      auto downsweep_kernel     = kernel_source.RadixSortDownsweepIndirectKernel();
+      auto alt_downsweep_kernel = kernel_source.RadixSortAltDownsweepIndirectKernel();
+
+      // Use max_num_items for pass config initialization
+      using UpsweepKernelT   = decltype(upsweep_kernel);
+      using ScanKernelT      = decltype(scan_kernel);
+      using DownsweepKernelT = decltype(downsweep_kernel);
+
+      using DispatchT =
+        DispatchRadixSort<Order, KeyT, ValueT, OffsetT, DecomposerT, fake_policy, KernelSource, KernelLauncherFactory>;
+
+      typename DispatchT::template PassConfig<UpsweepKernelT, ScanKernelT, DownsweepKernelT> pass_config,
+        alt_pass_config;
+
+      if (const auto error = pass_config.__init_pass_config(
+            upsweep_kernel,
+            scan_kernel,
+            downsweep_kernel,
+            sm_count,
+            max_num_items,
+            policy.downsweep.radix_bits,
+            policy.upsweep,
+            policy.scan,
+            policy.downsweep,
+            launcher_factory))
+      {
+        return error;
+      }
+
+      if (const auto error = alt_pass_config.__init_pass_config(
+            alt_upsweep_kernel,
+            scan_kernel,
+            alt_downsweep_kernel,
+            sm_count,
+            max_num_items,
+            policy.alt_downsweep.radix_bits,
+            policy.alt_upsweep,
+            policy.scan,
+            policy.alt_downsweep,
+            launcher_factory))
+      {
+        return error;
+      }
+
+      int max_grid_size =
+        ::cuda::std::max(pass_config.max_downsweep_grid_size, alt_pass_config.max_downsweep_grid_size);
+      int spine_length = (max_grid_size * pass_config.radix_digits) + pass_config.scan_config.tile_size;
+
+      void* allocations[3]       = {};
+      size_t allocation_sizes[3] = {
+        spine_length * sizeof(OffsetT),
+        // is_overwrite_okay is always false for indirect
+        max_num_items * kernel_source.KeySize(),
+        KEYS_ONLY ? 0 : max_num_items * kernel_source.ValueSize(),
+      };
+
+      if (const auto error =
+            CubDebug(detail::alias_temporaries(d_temp_storage, temp_storage_bytes, allocations, allocation_sizes)))
+      {
+        return error;
+      }
+
+      if (d_temp_storage == nullptr)
+      {
+        return cudaSuccess;
+      }
+
+      int num_bits           = end_bit - begin_bit;
+      int num_passes         = ::cuda::ceil_div(num_bits, pass_config.radix_bits);
+      bool is_num_passes_odd = num_passes & 1;
+      int max_alt_passes     = (num_passes * pass_config.radix_bits) - num_bits;
+      int alt_end_bit        = ::cuda::std::min(end_bit, begin_bit + (max_alt_passes * alt_pass_config.radix_bits));
+
+      OffsetT* d_spine = static_cast<OffsetT*>(allocations[0]);
+
+      DoubleBuffer<KeyT> d_keys_remaining_passes(
+        (is_overwrite_okay || is_num_passes_odd) ? d_keys.Alternate() : static_cast<KeyT*>(allocations[1]),
+        (is_overwrite_okay)   ? d_keys.Current()
+        : (is_num_passes_odd) ? static_cast<KeyT*>(allocations[1])
+                              : d_keys.Alternate());
+
+      DoubleBuffer<ValueT> d_values_remaining_passes(
+        (is_overwrite_okay || is_num_passes_odd) ? d_values.Alternate() : static_cast<ValueT*>(allocations[2]),
+        (is_overwrite_okay)   ? d_values.Current()
+        : (is_num_passes_odd) ? static_cast<ValueT*>(allocations[2])
+                              : d_values.Alternate());
+
+      // Helper to invoke a single indirect pass (upsweep -> scan -> downsweep)
+      auto invoke_indirect_pass =
+        [&](const KeyT* pass_keys_in,
+            KeyT* pass_keys_out,
+            const ValueT* pass_values_in,
+            ValueT* pass_values_out,
+            OffsetT* pass_spine,
+            int& current_bit,
+            auto& config) -> cudaError_t {
+        int pass_bits         = ::cuda::std::min(config.radix_bits, end_bit - current_bit);
+        int pass_spine_length = config.even_share.grid_size * config.radix_digits;
+
+        launcher_factory(config.even_share.grid_size, config.upsweep_config.block_threads, 0, stream)
+          .doit(config.upsweep_kernel,
+                pass_keys_in,
+                pass_spine,
+                d_num_items,
+                current_bit,
+                pass_bits,
+                config.even_share,
+                decomposer);
+
+        if (const auto error = CubDebug(cudaPeekAtLastError()))
+        {
+          return error;
+        }
+        if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+        {
+          return error;
+        }
+
+        launcher_factory(1, config.scan_config.block_threads, 0, stream)
+          .doit(config.scan_kernel, pass_spine, pass_spine_length);
+
+        if (const auto error = CubDebug(cudaPeekAtLastError()))
+        {
+          return error;
+        }
+        if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+        {
+          return error;
+        }
+
+        launcher_factory(config.even_share.grid_size, config.downsweep_config.block_threads, 0, stream)
+          .doit(config.downsweep_kernel,
+                pass_keys_in,
+                pass_keys_out,
+                pass_values_in,
+                pass_values_out,
+                pass_spine,
+                d_num_items,
+                current_bit,
+                pass_bits,
+                config.even_share,
+                decomposer);
+
+        if (const auto error = CubDebug(cudaPeekAtLastError()))
+        {
+          return error;
+        }
+        if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+        {
+          return error;
+        }
+
+        current_bit += pass_bits;
+        return cudaSuccess;
+      };
+
+      // Run first pass
+      int current_bit = begin_bit;
+      if (const auto error = CubDebug(invoke_indirect_pass(
+            d_keys.Current(),
+            d_keys_remaining_passes.Current(),
+            d_values.Current(),
+            d_values_remaining_passes.Current(),
+            d_spine,
+            current_bit,
+            (current_bit < alt_end_bit) ? alt_pass_config : pass_config)))
+      {
+        return error;
+      }
+
+      // Run remaining passes
+      while (current_bit < end_bit)
+      {
+        if (const auto error = CubDebug(invoke_indirect_pass(
+              d_keys_remaining_passes.d_buffers[d_keys_remaining_passes.selector],
+              d_keys_remaining_passes.d_buffers[d_keys_remaining_passes.selector ^ 1],
+              d_values_remaining_passes.d_buffers[d_keys_remaining_passes.selector],
+              d_values_remaining_passes.d_buffers[d_keys_remaining_passes.selector ^ 1],
+              d_spine,
+              current_bit,
+              (current_bit < alt_end_bit) ? alt_pass_config : pass_config)))
+        {
+          return error;
+        }
+
+        d_keys_remaining_passes.selector ^= 1;
+        d_values_remaining_passes.selector ^= 1;
+      }
+
+      // Update selector (is_overwrite_okay is always false)
+      num_passes        = 1;
+      d_keys.selector   = (d_keys.selector + num_passes) & 1;
+      d_values.selector = (d_values.selector + num_passes) & 1;
+
+      return cudaSuccess;
+    }
   });
 }
 } // namespace detail::radix_sort

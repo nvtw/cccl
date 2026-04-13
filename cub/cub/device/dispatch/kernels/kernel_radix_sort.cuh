@@ -579,6 +579,263 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceRadixSortExclusiveSumKernel(_CCCL_GRID_CONSTA
     d_bins[bin_start + bin] = bins[u];
   }
 }
+/******************************************************************************
+ * Indirect kernel variants (device-accessible num_items)
+ ******************************************************************************/
+
+/**
+ * @brief Indirect histogram kernel. Reads num_items from device memory.
+ */
+template <typename PolicySelector,
+          SortOrder Order,
+          typename KeyT,
+          typename OffsetT,
+          typename DecomposerT = identity_decomposer_t>
+_CCCL_KERNEL_ATTRIBUTES __launch_bounds__(
+  PolicySelector{}(::cuda::arch_id{CUB_PTX_ARCH / 10})
+    .histogram
+    .block_threads) void DeviceRadixSortHistogramIndirectKernel(_CCCL_GRID_CONSTANT OffsetT* const d_bins_out,
+                                                                _CCCL_GRID_CONSTANT const KeyT* const d_keys_in,
+                                                                _CCCL_GRID_CONSTANT const OffsetT* const d_num_items,
+                                                                _CCCL_GRID_CONSTANT const int start_bit,
+                                                                _CCCL_GRID_CONSTANT const int end_bit,
+                                                                _CCCL_GRID_CONSTANT const DecomposerT decomposer = {})
+{
+  static constexpr radix_sort_histogram_policy policy = PolicySelector{}(::cuda::arch_id{CUB_PTX_ARCH / 10}).histogram;
+
+  using HistogramPolicyT =
+    AgentRadixSortHistogramPolicy<policy.block_threads, policy.items_per_thread, policy.num_parts, void, policy.radix_bits>;
+  using AgentT = AgentRadixSortHistogram<HistogramPolicyT, Order == SortOrder::Descending, KeyT, OffsetT, DecomposerT>;
+  __shared__ typename AgentT::TempStorage temp_storage;
+  const OffsetT num_items = *d_num_items;
+  AgentT agent(temp_storage, d_bins_out, d_keys_in, num_items, start_bit, end_bit, decomposer);
+  agent.Process();
+}
+
+/**
+ * @brief Indirect onesweep kernel. Reads num_items from device memory and computes
+ *        the portion's item count on-device, early-exiting for empty portions.
+ *
+ * Uses a pre-filter counter (d_pre_filter_ctr) to ensure only the correct number
+ * of blocks participate in the onesweep agent. This is critical because the agent
+ * uses atomicAdd for dynamic tile assignment and the lookback protocol requires
+ * all participating blocks to report correct counts. Extra blocks (launched for
+ * max_num_items but beyond actual data) return early before constructing the agent.
+ */
+template <typename PolicySelector,
+          SortOrder Order,
+          typename KeyT,
+          typename ValueT,
+          typename OffsetT,
+          typename PortionOffsetT,
+          typename AtomicOffsetT = PortionOffsetT,
+          typename DecomposerT   = identity_decomposer_t>
+_CCCL_KERNEL_ATTRIBUTES void
+__launch_bounds__(PolicySelector{}(::cuda::arch_id{CUB_PTX_ARCH / 10}).onesweep.block_threads)
+  DeviceRadixSortOnesweepIndirectKernel(
+    _CCCL_GRID_CONSTANT AtomicOffsetT* const d_lookback,
+    _CCCL_GRID_CONSTANT AtomicOffsetT* const d_ctrs,
+    _CCCL_GRID_CONSTANT AtomicOffsetT* const d_pre_filter_ctr,
+    _CCCL_GRID_CONSTANT OffsetT* const d_bins_out,
+    _CCCL_GRID_CONSTANT const OffsetT* const d_bins_in,
+    _CCCL_GRID_CONSTANT KeyT* const d_keys_out,
+    _CCCL_GRID_CONSTANT const KeyT* const d_keys_in,
+    _CCCL_GRID_CONSTANT ValueT* const d_values_out,
+    _CCCL_GRID_CONSTANT const ValueT* const d_values_in,
+    _CCCL_GRID_CONSTANT const OffsetT* const d_num_items,
+    _CCCL_GRID_CONSTANT const OffsetT portion_offset,
+    _CCCL_GRID_CONSTANT const PortionOffsetT max_portion_num_items,
+    _CCCL_GRID_CONSTANT const int current_bit,
+    _CCCL_GRID_CONSTANT const int num_bits,
+    _CCCL_GRID_CONSTANT const DecomposerT decomposer = {})
+{
+  const OffsetT total_num_items = *d_num_items;
+  if (portion_offset >= total_num_items)
+  {
+    return;
+  }
+  const PortionOffsetT portion_num_items = static_cast<PortionOffsetT>(
+    ::cuda::std::min(total_num_items - portion_offset, static_cast<OffsetT>(max_portion_num_items)));
+
+  static constexpr radix_sort_onesweep_policy policy = PolicySelector{}(::cuda::arch_id{CUB_PTX_ARCH / 10}).onesweep;
+  constexpr int ONESWEEP_TILE_ITEMS                  = policy.block_threads * policy.items_per_thread;
+
+  // Pre-filter: only the correct number of blocks may construct the agent.
+  // The agent's constructor does atomicAdd(d_ctrs, 1) for tile assignment,
+  // so only actual_num_blocks blocks must reach it.
+  const PortionOffsetT actual_num_blocks = (portion_num_items + ONESWEEP_TILE_ITEMS - 1) / ONESWEEP_TILE_ITEMS;
+
+  __shared__ PortionOffsetT s_pre_idx;
+  if (threadIdx.x == 0)
+  {
+    s_pre_idx = atomicAdd(d_pre_filter_ctr, 1);
+  }
+  __syncthreads();
+
+  if (s_pre_idx >= actual_num_blocks)
+  {
+    return;
+  }
+
+  using OnesweepPolicyT = AgentRadixSortOnesweepPolicy<
+    policy.block_threads,
+    policy.items_per_thread,
+    void,
+    policy.rank_num_parts,
+    policy.rank_algorith,
+    policy.scan_algorithm,
+    policy.store_algorithm,
+    policy.radix_bits,
+    NoScaling<policy.block_threads, policy.items_per_thread>>;
+
+  using AgentT =
+    AgentRadixSortOnesweep<OnesweepPolicyT,
+                           Order == SortOrder::Descending,
+                           KeyT,
+                           ValueT,
+                           OffsetT,
+                           PortionOffsetT,
+                           DecomposerT>;
+  __shared__ typename AgentT::TempStorage s;
+
+  AgentT agent(
+    s,
+    d_lookback,
+    d_ctrs,
+    d_bins_out,
+    d_bins_in,
+    d_keys_out,
+    d_keys_in,
+    d_values_out,
+    d_values_in,
+    portion_num_items,
+    current_bit,
+    num_bits,
+    decomposer);
+  agent.Process();
+}
+
+/**
+ * @brief Indirect upsweep kernel. Reads num_items from device memory.
+ */
+template <typename PolicySelector,
+          bool ALT_DIGIT_BITS,
+          SortOrder Order,
+          typename KeyT,
+          typename OffsetT,
+          typename DecomposerT = detail::identity_decomposer_t>
+__launch_bounds__(int(ALT_DIGIT_BITS ? PolicySelector{}(::cuda::arch_id{CUB_PTX_ARCH / 10}).alt_upsweep.block_threads
+                                     : PolicySelector{}(::cuda::arch_id{CUB_PTX_ARCH / 10}).upsweep.block_threads))
+  _CCCL_KERNEL_ATTRIBUTES void DeviceRadixSortUpsweepIndirectKernel(
+    _CCCL_GRID_CONSTANT const KeyT* const d_keys,
+    _CCCL_GRID_CONSTANT OffsetT* const d_spine,
+    _CCCL_GRID_CONSTANT const OffsetT* const d_num_items,
+    _CCCL_GRID_CONSTANT const int current_bit,
+    _CCCL_GRID_CONSTANT const int num_bits,
+    GridEvenShare<OffsetT> even_share,
+    _CCCL_GRID_CONSTANT const DecomposerT decomposer = {})
+{
+  static constexpr radix_sort_policy policy = PolicySelector{}(::cuda::arch_id{CUB_PTX_ARCH / 10});
+  static constexpr radix_sort_upsweep_policy active_upsweep_policy =
+    ALT_DIGIT_BITS ? policy.alt_upsweep : policy.upsweep;
+  static constexpr radix_sort_downsweep_policy active_downsweep_policy =
+    ALT_DIGIT_BITS ? policy.alt_downsweep : policy.downsweep;
+
+  static constexpr int TILE_ITEMS =
+    ::cuda::std::max(active_upsweep_policy.block_threads * active_upsweep_policy.items_per_thread,
+                     active_downsweep_policy.block_threads * active_downsweep_policy.items_per_thread);
+
+  using ActiveUpsweepPolicyT =
+    AgentRadixSortUpsweepPolicy<active_upsweep_policy.block_threads,
+                                active_upsweep_policy.items_per_thread,
+                                void,
+                                active_upsweep_policy.load_modifier,
+                                active_upsweep_policy.radix_bits,
+                                NoScaling<active_upsweep_policy.block_threads, active_upsweep_policy.items_per_thread>>;
+
+  using AgentRadixSortUpsweepT =
+    detail::radix_sort::AgentRadixSortUpsweep<ActiveUpsweepPolicyT, KeyT, OffsetT, DecomposerT>;
+
+  __shared__ typename AgentRadixSortUpsweepT::TempStorage temp_storage;
+
+  const OffsetT num_items = *d_num_items;
+  even_share.num_items    = num_items;
+  even_share.template BlockInit<TILE_ITEMS, GRID_MAPPING_RAKE>();
+
+  OffsetT block_offset = ::cuda::std::min(even_share.block_offset, num_items);
+  OffsetT block_end    = ::cuda::std::min(even_share.block_end, num_items);
+
+  AgentRadixSortUpsweepT upsweep(temp_storage, d_keys, current_bit, num_bits, decomposer);
+
+  upsweep.ProcessRegion(block_offset, block_end);
+
+  __syncthreads();
+
+  upsweep.template ExtractCounts<Order == SortOrder::Descending>(d_spine, gridDim.x, blockIdx.x);
+}
+
+/**
+ * @brief Indirect downsweep kernel. Reads num_items from device memory.
+ */
+template <typename PolicySelector,
+          bool ALT_DIGIT_BITS,
+          SortOrder Order,
+          typename KeyT,
+          typename ValueT,
+          typename OffsetT,
+          typename DecomposerT = detail::identity_decomposer_t>
+__launch_bounds__(int(ALT_DIGIT_BITS ? PolicySelector{}(::cuda::arch_id{CUB_PTX_ARCH / 10}).alt_downsweep.block_threads
+                                     : PolicySelector{}(::cuda::arch_id{CUB_PTX_ARCH / 10}).downsweep.block_threads))
+  _CCCL_KERNEL_ATTRIBUTES void DeviceRadixSortDownsweepIndirectKernel(
+    _CCCL_GRID_CONSTANT const KeyT* const d_keys_in,
+    _CCCL_GRID_CONSTANT KeyT* const d_keys_out,
+    _CCCL_GRID_CONSTANT const ValueT* const d_values_in,
+    _CCCL_GRID_CONSTANT ValueT* const d_values_out,
+    _CCCL_GRID_CONSTANT OffsetT* const d_spine,
+    _CCCL_GRID_CONSTANT const OffsetT* const d_num_items,
+    _CCCL_GRID_CONSTANT const int current_bit,
+    _CCCL_GRID_CONSTANT const int num_bits,
+    GridEvenShare<OffsetT> even_share,
+    _CCCL_GRID_CONSTANT const DecomposerT decomposer = {})
+{
+  static constexpr radix_sort_policy policy = PolicySelector{}(::cuda::arch_id{CUB_PTX_ARCH / 10});
+
+  static constexpr radix_sort_upsweep_policy active_upsweep_policy =
+    ALT_DIGIT_BITS ? policy.alt_upsweep : policy.upsweep;
+  static constexpr radix_sort_downsweep_policy active_downsweep_policy =
+    ALT_DIGIT_BITS ? policy.alt_downsweep : policy.downsweep;
+
+  static constexpr int TILE_ITEMS =
+    ::cuda::std::max(active_upsweep_policy.block_threads * active_upsweep_policy.items_per_thread,
+                     active_downsweep_policy.block_threads * active_downsweep_policy.items_per_thread);
+
+  using ActiveDownsweepPolicyT = AgentRadixSortDownsweepPolicy<
+    active_downsweep_policy.block_threads,
+    active_downsweep_policy.items_per_thread,
+    void,
+    active_downsweep_policy.load_algorithm,
+    active_downsweep_policy.load_modifier,
+    active_downsweep_policy.rank_algorithm,
+    active_downsweep_policy.scan_algorithm,
+    active_downsweep_policy.radix_bits,
+    NoScaling<active_downsweep_policy.block_threads, active_downsweep_policy.items_per_thread>>;
+
+  using AgentRadixSortDownsweepT = radix_sort::
+    AgentRadixSortDownsweep<ActiveDownsweepPolicyT, Order == SortOrder::Descending, KeyT, ValueT, OffsetT, DecomposerT>;
+
+  __shared__ typename AgentRadixSortDownsweepT::TempStorage temp_storage;
+
+  const OffsetT num_items = *d_num_items;
+  even_share.num_items    = num_items;
+  even_share.template BlockInit<TILE_ITEMS, GRID_MAPPING_RAKE>();
+
+  OffsetT block_offset = ::cuda::std::min(even_share.block_offset, num_items);
+  OffsetT block_end    = ::cuda::std::min(even_share.block_end, num_items);
+
+  AgentRadixSortDownsweepT(
+    temp_storage, num_items, d_spine, d_keys_in, d_keys_out, d_values_in, d_values_out, current_bit, num_bits, decomposer)
+    .ProcessRegion(block_offset, block_end);
+}
 } // namespace detail::radix_sort
 
 CUB_NAMESPACE_END

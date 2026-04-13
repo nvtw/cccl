@@ -5062,6 +5062,249 @@ public:
   }
 
   //! @}
+
+  //! @name Indirect sorts (device-accessible num_items)
+  //! @{
+
+  //! @rst
+  //! Sorts key-value pairs into ascending order.
+  //! The actual number of items to sort is read from device memory (``d_num_items``),
+  //! enabling CUDA graph capture with variable-length inputs.
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - An additional ``~2N`` auxiliary storage is required.
+  //! - Results are always written to ``d_keys_out`` and ``d_values_out``.
+  //! - ``max_num_items`` is used for host-side resource allocation (temp storage, grid sizing).
+  //!   The actual number of items sorted is ``*d_num_items`` which must be ``<= max_num_items``.
+  //! - When ``d_temp_storage`` is ``nullptr``, no work is done and the required allocation size
+  //!   is written to ``temp_storage_bytes``.
+  //!
+  //! Snippet
+  //! +++++++
+  //!
+  //! .. code-block:: c++
+  //!
+  //!    #include <cub/cub.cuh>
+  //!
+  //!    int  max_num_items = 1000;
+  //!    int  *d_num_items;   // device-accessible, *d_num_items <= max_num_items
+  //!    int  *d_keys_in, *d_keys_out;
+  //!    int  *d_values_in, *d_values_out;
+  //!    ...
+  //!
+  //!    void *d_temp_storage = nullptr;
+  //!    size_t temp_storage_bytes = 0;
+  //!    cub::DeviceRadixSort::SortPairs(
+  //!        d_temp_storage, temp_storage_bytes,
+  //!        d_keys_in, d_keys_out, d_values_in, d_values_out,
+  //!        d_num_items, max_num_items);
+  //!    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+  //!    cub::DeviceRadixSort::SortPairs(
+  //!        d_temp_storage, temp_storage_bytes,
+  //!        d_keys_in, d_keys_out, d_values_in, d_values_out,
+  //!        d_num_items, max_num_items);
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @param[in] d_temp_storage
+  //!   Device-accessible allocation of temporary storage. When ``nullptr``, the
+  //!   required allocation size is written to ``temp_storage_bytes`` and no work
+  //!   is done.
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] d_values_in
+  //!   Pointer to the corresponding input sequence of associated value items
+  //!
+  //! @param[out] d_values_out
+  //!   Pointer to the correspondingly-reordered output sequence of associated
+  //!   value items
+  //!
+  //! @param[in] d_num_items
+  //!   Pointer to device-accessible memory holding the actual number of items to sort
+  //!
+  //! @param[in] max_num_items
+  //!   Maximum number of items that could be sorted (upper bound for resource allocation)
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT, typename ValueT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairs(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    const NumItemsT* d_num_items,
+    NumItemsT max_num_items,
+    int begin_bit       = 0,
+    int end_bit         = sizeof(KeyT) * 8,
+    cudaStream_t stream = 0)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceRadixSort::SortPairs");
+
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    return detail::radix_sort::dispatch_indirect<detail::radix_sort::SortOrder::Ascending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys_in,
+      d_keys_out,
+      d_values_in,
+      d_values_out,
+      reinterpret_cast<const OffsetT*>(d_num_items),
+      static_cast<OffsetT>(max_num_items),
+      begin_bit,
+      end_bit,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into descending order.
+  //! The actual number of items to sort is read from device memory (``d_num_items``),
+  //! enabling CUDA graph capture with variable-length inputs.
+  //!
+  //! - See ascending ``SortPairs`` indirect overload for full details.
+  //! @endrst
+  template <typename KeyT, typename ValueT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairsDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    const NumItemsT* d_num_items,
+    NumItemsT max_num_items,
+    int begin_bit       = 0,
+    int end_bit         = sizeof(KeyT) * 8,
+    cudaStream_t stream = 0)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceRadixSort::SortPairsDescending");
+
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    return detail::radix_sort::dispatch_indirect<detail::radix_sort::SortOrder::Descending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys_in,
+      d_keys_out,
+      d_values_in,
+      d_values_out,
+      reinterpret_cast<const OffsetT*>(d_num_items),
+      static_cast<OffsetT>(max_num_items),
+      begin_bit,
+      end_bit,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts keys into ascending order.
+  //! The actual number of items to sort is read from device memory (``d_num_items``),
+  //! enabling CUDA graph capture with variable-length inputs.
+  //!
+  //! - See ascending ``SortPairs`` indirect overload for full details (without value arrays).
+  //! @endrst
+  template <typename KeyT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeys(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const NumItemsT* d_num_items,
+    NumItemsT max_num_items,
+    int begin_bit       = 0,
+    int end_bit         = sizeof(KeyT) * 8,
+    cudaStream_t stream = 0)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceRadixSort::SortKeys");
+
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    constexpr NullType* d_values_in  = nullptr;
+    constexpr NullType* d_values_out = nullptr;
+
+    return detail::radix_sort::dispatch_indirect<detail::radix_sort::SortOrder::Ascending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys_in,
+      d_keys_out,
+      d_values_in,
+      d_values_out,
+      reinterpret_cast<const OffsetT*>(d_num_items),
+      static_cast<OffsetT>(max_num_items),
+      begin_bit,
+      end_bit,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts keys into descending order.
+  //! The actual number of items to sort is read from device memory (``d_num_items``),
+  //! enabling CUDA graph capture with variable-length inputs.
+  //!
+  //! - See ascending ``SortPairs`` indirect overload for full details (without value arrays).
+  //! @endrst
+  template <typename KeyT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeysDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const NumItemsT* d_num_items,
+    NumItemsT max_num_items,
+    int begin_bit       = 0,
+    int end_bit         = sizeof(KeyT) * 8,
+    cudaStream_t stream = 0)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceRadixSort::SortKeysDescending");
+
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    constexpr NullType* d_values_in  = nullptr;
+    constexpr NullType* d_values_out = nullptr;
+
+    return detail::radix_sort::dispatch_indirect<detail::radix_sort::SortOrder::Descending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys_in,
+      d_keys_out,
+      d_values_in,
+      d_values_out,
+      reinterpret_cast<const OffsetT*>(d_num_items),
+      static_cast<OffsetT>(max_num_items),
+      begin_bit,
+      end_bit,
+      stream);
+  }
+
+  //! @}
 };
 
 CUB_NAMESPACE_END
