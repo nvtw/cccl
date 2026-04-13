@@ -584,6 +584,35 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceRadixSortExclusiveSumKernel(_CCCL_GRID_CONSTA
  ******************************************************************************/
 
 /**
+ * @brief Indirect lookback memset kernel. Reads num_items from device memory and
+ *        only clears the lookback entries needed for the actual data, not max_num_items.
+ *        This avoids wasted memory bandwidth when actual << max.
+ */
+template <typename AtomicOffsetT, typename OffsetT, typename PortionOffsetT>
+_CCCL_KERNEL_ATTRIBUTES void DeviceRadixSortIndirectLookbackMemsetKernel(
+  AtomicOffsetT* d_lookback,
+  const OffsetT* d_num_items,
+  const OffsetT portion_offset,
+  const int radix_digits,
+  const int tile_items)
+{
+  const OffsetT total_num_items = *d_num_items;
+  if (portion_offset >= total_num_items)
+  {
+    return;
+  }
+  const PortionOffsetT portion_num_items = static_cast<PortionOffsetT>(
+    ::cuda::std::min(total_num_items - portion_offset, static_cast<OffsetT>(((1 << 28) - 1) / tile_items * tile_items)));
+  const PortionOffsetT actual_num_blocks = (portion_num_items + tile_items - 1) / tile_items;
+  const int total_entries                = actual_num_blocks * radix_digits;
+  const int i                            = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < total_entries)
+  {
+    d_lookback[i] = 0;
+  }
+}
+
+/**
  * @brief Indirect histogram kernel. Reads num_items from device memory.
  */
 template <typename PolicySelector,

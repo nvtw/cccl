@@ -1722,6 +1722,259 @@ CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE cudaError_t dispatch_indirect(
     }
   });
 }
+/**
+ * @brief DoubleBuffer-aware indirect dispatch. Uses is_overwrite_okay=true,
+ *        which avoids extra key/value buffer allocations and lets the sort
+ *        ping-pong directly between the two DoubleBuffer halves.
+ *        The caller must update d_keys.selector after the call.
+ */
+template <SortOrder Order,
+          typename KeyT,
+          typename ValueT,
+          typename OffsetT,
+          typename DecomposerT    = identity_decomposer_t,
+          typename PolicySelector = policy_selector_from_types<KeyT, ValueT, OffsetT>,
+          typename KernelSource = DeviceRadixSortKernelSource<PolicySelector, Order, KeyT, ValueT, OffsetT, DecomposerT>,
+          typename KernelLauncherFactory = CUB_DETAIL_DEFAULT_KERNEL_LAUNCHER_FACTORY>
+CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE cudaError_t dispatch_indirect_double_buffer(
+  void* d_temp_storage,
+  size_t& temp_storage_bytes,
+  DoubleBuffer<KeyT>& d_keys,
+  DoubleBuffer<ValueT>& d_values,
+  const OffsetT* d_num_items,
+  OffsetT max_num_items,
+  int begin_bit,
+  int end_bit,
+  cudaStream_t stream,
+  DecomposerT decomposer                 = {},
+  PolicySelector policy_selector         = {},
+  KernelSource kernel_source             = {},
+  KernelLauncherFactory launcher_factory = {})
+{
+  static_assert(::cuda::std::is_unsigned_v<OffsetT> && sizeof(OffsetT) >= 4,
+                "dispatch_indirect only supports unsigned offset types of at least 4-bytes");
+
+  constexpr bool KEYS_ONLY = ::cuda::std::is_same_v<ValueT, NullType>;
+
+  ::cuda::arch_id arch_id{};
+  if (const auto error = CubDebug(launcher_factory.PtxArchId(arch_id)))
+  {
+    return error;
+  }
+
+  return dispatch_arch(policy_selector, arch_id, [&](auto policy_getter) -> cudaError_t {
+    CUB_DETAIL_CONSTEXPR_ISH auto policy = policy_getter();
+
+    if (max_num_items == 0 || begin_bit == end_bit)
+    {
+      if (d_temp_storage == nullptr)
+      {
+        temp_storage_bytes = 1;
+      }
+      return cudaSuccess;
+    }
+
+    // is_overwrite_okay = true: no extra key/value buffers needed
+    constexpr bool is_overwrite_okay = true;
+
+#if _CCCL_COMPILER(GCC, <, 10)
+    if CUB_DETAIL_CONSTEXPR_ISH (decltype(policy_getter){}().use_onesweep)
+#else
+    if CUB_DETAIL_CONSTEXPR_ISH (policy.use_onesweep)
+#endif
+    {
+      // ===== Onesweep indirect path (DoubleBuffer) =====
+      using PortionOffsetT = int;
+      using AtomicOffsetT  = PortionOffsetT;
+
+      const int RADIX_BITS                = policy.onesweep.radix_bits;
+      const int RADIX_DIGITS              = 1 << RADIX_BITS;
+      const int ONESWEEP_ITEMS_PER_THREAD = policy.onesweep.items_per_thread;
+      const int ONESWEEP_BLOCK_THREADS    = policy.onesweep.block_threads;
+      const int ONESWEEP_TILE_ITEMS       = ONESWEEP_ITEMS_PER_THREAD * ONESWEEP_BLOCK_THREADS;
+      const PortionOffsetT PORTION_SIZE   = ((1 << 28) - 1) / ONESWEEP_TILE_ITEMS * ONESWEEP_TILE_ITEMS;
+      int num_passes                      = ::cuda::ceil_div(end_bit - begin_bit, RADIX_BITS);
+      OffsetT max_num_portions            = static_cast<OffsetT>(::cuda::ceil_div(max_num_items, PORTION_SIZE));
+      PortionOffsetT max_num_blocks       = ::cuda::ceil_div(
+        static_cast<int>(::cuda::std::min(max_num_items, static_cast<OffsetT>(PORTION_SIZE))), ONESWEEP_TILE_ITEMS);
+
+      // No extra key/value buffers (is_overwrite_okay = true)
+      size_t allocation_sizes[] = {
+        // bins
+        max_num_portions * num_passes * RADIX_DIGITS * sizeof(OffsetT),
+        // lookback
+        max_num_blocks * RADIX_DIGITS * sizeof(AtomicOffsetT),
+        // counters (for agent tile assignment)
+        max_num_portions * num_passes * sizeof(AtomicOffsetT),
+        // pre-filter counters
+        max_num_portions * num_passes * sizeof(AtomicOffsetT),
+      };
+      constexpr int NUM_ALLOCATIONS      = sizeof(allocation_sizes) / sizeof(allocation_sizes[0]);
+      void* allocations[NUM_ALLOCATIONS] = {};
+      if (const auto error = CubDebug(detail::alias_temporaries<NUM_ALLOCATIONS>(
+            d_temp_storage, temp_storage_bytes, allocations, allocation_sizes)))
+      {
+        return error;
+      }
+
+      if (d_temp_storage == nullptr)
+      {
+        return cudaSuccess;
+      }
+
+      OffsetT* d_bins                  = (OffsetT*) allocations[0];
+      AtomicOffsetT* d_lookback        = (AtomicOffsetT*) allocations[1];
+      AtomicOffsetT* d_ctrs            = (AtomicOffsetT*) allocations[2];
+      AtomicOffsetT* d_pre_filter_ctrs = (AtomicOffsetT*) allocations[3];
+
+      // Memset counters
+      if (const auto error =
+            CubDebug(cudaMemsetAsync(d_ctrs, 0, max_num_portions * num_passes * sizeof(AtomicOffsetT), stream)))
+      {
+        return error;
+      }
+      if (const auto error = CubDebug(
+            cudaMemsetAsync(d_pre_filter_ctrs, 0, max_num_portions * num_passes * sizeof(AtomicOffsetT), stream)))
+      {
+        return error;
+      }
+      if (const auto error = CubDebug(cudaMemsetAsync(d_bins, 0, num_passes * RADIX_DIGITS * sizeof(OffsetT), stream)))
+      {
+        return error;
+      }
+
+      int device  = -1;
+      int num_sms = 0;
+      if (const auto error = CubDebug(cudaGetDevice(&device)))
+      {
+        return error;
+      }
+      if (const auto error = CubDebug(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device)))
+      {
+        return error;
+      }
+
+      const int HISTO_BLOCK_THREADS = policy.histogram.block_threads;
+      int histo_blocks_per_sm       = 1;
+      auto histogram_kernel         = kernel_source.RadixSortHistogramIndirectKernel();
+      if (const auto error =
+            CubDebug(launcher_factory.MaxSmOccupancy(histo_blocks_per_sm, histogram_kernel, HISTO_BLOCK_THREADS, 0)))
+      {
+        return error;
+      }
+
+      if (const auto error = CubDebug(
+            launcher_factory(histo_blocks_per_sm * num_sms, HISTO_BLOCK_THREADS, 0, stream)
+              .doit(histogram_kernel, d_bins, d_keys.Current(), d_num_items, begin_bit, end_bit, decomposer)))
+      {
+        return error;
+      }
+
+      if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+      {
+        return error;
+      }
+
+      const int SCAN_BLOCK_THREADS = policy.exclusive_sum.block_threads;
+      if (const auto error = CubDebug(launcher_factory(num_passes, SCAN_BLOCK_THREADS, 0, stream)
+                                        .doit(kernel_source.RadixSortExclusiveSumKernel(), d_bins)))
+      {
+        return error;
+      }
+
+      if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+      {
+        return error;
+      }
+
+      // No buffer swapping needed (is_overwrite_okay = true)
+
+      for (int current_bit = begin_bit, pass = 0; current_bit < end_bit; current_bit += RADIX_BITS, ++pass)
+      {
+        int num_bits = ::cuda::std::min(end_bit - current_bit, RADIX_BITS);
+        for (OffsetT portion = 0; portion < max_num_portions; ++portion)
+        {
+          OffsetT portion_offset               = portion * PORTION_SIZE;
+          PortionOffsetT max_portion_num_items = static_cast<PortionOffsetT>(
+            ::cuda::std::min(max_num_items - portion_offset, static_cast<OffsetT>(PORTION_SIZE)));
+          PortionOffsetT max_portion_blocks = ::cuda::ceil_div(max_portion_num_items, ONESWEEP_TILE_ITEMS);
+
+          // Indirect lookback memset: only clears entries for actual data
+          {
+            constexpr int memset_block = 256;
+            int memset_grid = ::cuda::ceil_div(max_portion_blocks * RADIX_DIGITS, memset_block);
+            if (const auto error = CubDebug(
+                  launcher_factory(memset_grid, memset_block, 0, stream)
+                    .doit(DeviceRadixSortIndirectLookbackMemsetKernel<AtomicOffsetT, OffsetT, PortionOffsetT>,
+                          d_lookback,
+                          d_num_items,
+                          portion_offset,
+                          RADIX_DIGITS,
+                          ONESWEEP_TILE_ITEMS)))
+            {
+              return error;
+            }
+          }
+
+          auto onesweep_kernel = kernel_source.RadixSortOnesweepIndirectKernel();
+
+          if (const auto error = CubDebug(
+                launcher_factory(max_portion_blocks, ONESWEEP_BLOCK_THREADS, 0, stream)
+                  .doit(onesweep_kernel,
+                        d_lookback,
+                        d_ctrs + portion * num_passes + pass,
+                        d_pre_filter_ctrs + portion * num_passes + pass,
+                        portion < max_num_portions - 1 ? d_bins + ((portion + 1) * num_passes + pass) * RADIX_DIGITS
+                                                       : nullptr,
+                        d_bins + (portion * num_passes + pass) * RADIX_DIGITS,
+                        d_keys.Alternate(),
+                        kernel_source.AdvanceKeys(d_keys.Current(), portion_offset),
+                        d_values.Alternate(),
+                        kernel_source.AdvanceValues(d_values.Current(), portion_offset),
+                        d_num_items,
+                        portion_offset,
+                        max_portion_num_items,
+                        current_bit,
+                        num_bits,
+                        decomposer)))
+          {
+            return error;
+          }
+
+          if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+          {
+            return error;
+          }
+        }
+
+        d_keys.selector ^= 1;
+        d_values.selector ^= 1;
+      }
+
+      return cudaSuccess;
+    }
+    else
+    {
+      // Legacy path: fall back to separate in/out dispatch
+      return dispatch_indirect<Order>(
+        d_temp_storage,
+        temp_storage_bytes,
+        d_keys.Current(),
+        d_keys.Alternate(),
+        d_values.Current(),
+        d_values.Alternate(),
+        d_num_items,
+        max_num_items,
+        begin_bit,
+        end_bit,
+        stream,
+        decomposer,
+        policy_selector,
+        kernel_source,
+        launcher_factory);
+    }
+  });
+}
 } // namespace detail::radix_sort
 
 CUB_NAMESPACE_END

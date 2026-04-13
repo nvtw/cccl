@@ -5306,6 +5306,135 @@ public:
       stream);
   }
 
+  //! @rst
+  //! Sorts key-value pairs into ascending order using a DoubleBuffer.
+  //! The actual number of items to sort is read from device memory (``d_num_items``),
+  //! enabling CUDA graph capture with variable-length inputs.
+  //!
+  //! - After the sort, ``d_keys.Current()`` and ``d_values.Current()`` point to the
+  //!   buffer holding the sorted output. The selector outcome is deterministic for a
+  //!   given ``KeyT`` and bit range (independent of ``*d_num_items``), so it is safe
+  //!   to query it once and reuse across graph replays.
+  //! - ``max_num_items`` is used for host-side resource allocation.
+  //! @endrst
+  template <typename KeyT, typename ValueT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairs(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    const NumItemsT* d_num_items,
+    NumItemsT max_num_items,
+    int begin_bit,
+    int end_bit,
+    cudaStream_t stream = 0)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceRadixSort::SortPairs");
+
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    return detail::radix_sort::dispatch_indirect_double_buffer<SortOrder::Ascending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      reinterpret_cast<const OffsetT*>(d_num_items),
+      static_cast<OffsetT>(max_num_items),
+      begin_bit,
+      end_bit,
+      stream);
+  }
+
+  //! @brief Sorts key-value pairs into descending order using a DoubleBuffer
+  //!   with device-accessible ``d_num_items``. See ascending overload for details.
+  template <typename KeyT, typename ValueT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairsDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    const NumItemsT* d_num_items,
+    NumItemsT max_num_items,
+    int begin_bit,
+    int end_bit,
+    cudaStream_t stream = 0)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceRadixSort::SortPairsDescending");
+
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    return detail::radix_sort::dispatch_indirect_double_buffer<SortOrder::Descending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      reinterpret_cast<const OffsetT*>(d_num_items),
+      static_cast<OffsetT>(max_num_items),
+      begin_bit,
+      end_bit,
+      stream);
+  }
+
+  //! @brief Sorts keys into ascending order using a DoubleBuffer
+  //!   with device-accessible ``d_num_items``. See SortPairs overload for details.
+  template <typename KeyT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeys(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    const NumItemsT* d_num_items,
+    NumItemsT max_num_items,
+    int begin_bit,
+    int end_bit,
+    cudaStream_t stream = 0)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceRadixSort::SortKeys");
+
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    DoubleBuffer<NullType> d_values;
+    return detail::radix_sort::dispatch_indirect_double_buffer<SortOrder::Ascending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      reinterpret_cast<const OffsetT*>(d_num_items),
+      static_cast<OffsetT>(max_num_items),
+      begin_bit,
+      end_bit,
+      stream);
+  }
+
+  //! @brief Sorts keys into descending order using a DoubleBuffer
+  //!   with device-accessible ``d_num_items``. See SortPairs overload for details.
+  template <typename KeyT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeysDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    const NumItemsT* d_num_items,
+    NumItemsT max_num_items,
+    int begin_bit,
+    int end_bit,
+    cudaStream_t stream = 0)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, "cub::DeviceRadixSort::SortKeysDescending");
+
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    DoubleBuffer<NullType> d_values;
+    return detail::radix_sort::dispatch_indirect_double_buffer<SortOrder::Descending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      reinterpret_cast<const OffsetT*>(d_num_items),
+      static_cast<OffsetT>(max_num_items),
+      begin_bit,
+      end_bit,
+      stream);
+  }
+
   //! @}
 };
 
